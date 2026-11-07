@@ -1,0 +1,461 @@
+// 逻辑检查：用模拟的窗口系统验证配对规则和关闭流程。不需要任何系统权限。
+// 运行：scripts/build.sh checks
+import Foundation
+import CoreGraphics
+
+final class MockAXWindow {
+    var info: AXWindowInfo
+    var cgID: CGWindowID
+    var alive = true
+    init(_ info: AXWindowInfo, cgID: CGWindowID) {
+        self.info = info
+        self.cgID = cgID
+    }
+}
+
+final class MockBackend: WindowBackend {
+    var windows: [CGWindowID: CGWindowInfo] = [:]
+    var ax: [pid_t: [MockAXWindow]] = [:]
+    var running: Set<pid_t> = []
+    var trusted = true
+    var unresponsive: Set<pid_t> = []
+    var clock: Double = 0
+    var pressed: [CGWindowID] = []
+    var timeline: [(Double, () -> Void)] = []
+    /// 按下关闭按钮时发生什么；默认：窗口立即销毁
+    var onPress: ((MockAXWindow) -> AXActionResult)?
+
+    func add(_ id: CGWindowID, pid: pid_t, title: String?, frame: CGRect, axTitle: String? = nil, layer: Int = 0,
+             ax axInfo: AXWindowInfo? = nil, noAX: Bool = false) {
+        windows[id] = CGWindowInfo(windowID: id, pid: pid, ownerName: "App\(pid)", title: title, bounds: frame, layer: layer)
+        running.insert(pid)
+        if !noAX {
+            let info = axInfo ?? AXWindowInfo(title: axTitle ?? title, frame: frame)
+            ax[pid, default: []].append(MockAXWindow(info, cgID: id))
+        }
+    }
+
+    func remove(_ id: CGWindowID) {
+        guard let w = windows.removeValue(forKey: id) else { return }
+        for a in ax[w.pid] ?? [] where a.cgID == id { a.alive = false }
+        ax[w.pid]?.removeAll { $0.cgID == id }
+    }
+
+    func onScreenWindows() -> [CGWindowInfo] { windows.values.filter(\.isOnScreen).sorted { $0.windowID < $1.windowID } }
+    func windowInfo(_ id: CGWindowID) -> CGWindowInfo? { windows[id] }
+    func isAppRunning(_ pid: pid_t) -> Bool { running.contains(pid) }
+
+    var quitRequests: [pid_t] = []
+    /// 收到退出请求时发生什么；默认：应用立即退出
+    var onTerminate: ((pid_t) -> Bool)?
+    func terminateApp(_ pid: pid_t) -> Bool {
+        quitRequests.append(pid)
+        if let onTerminate { return onTerminate(pid) }
+        running.remove(pid)
+        for id in windows.values.filter({ $0.pid == pid }).map(\.windowID) { remove(id) }
+        return true
+    }
+
+    func axWindows(pid: pid_t, timeout: Float, includeSheetCheck: Bool) -> Result<[AXWindowRef], AXAccessError> {
+        if !trusted { return .failure(.notTrusted) }
+        if unresponsive.contains(pid) { return .failure(.appUnresponsive) }
+        return .success((ax[pid] ?? []).map { AXWindowRef(info: $0.info, handle: $0) })
+    }
+
+    func pressCloseButton(of ref: AXWindowRef, timeout: Float) -> AXActionResult {
+        let w = ref.handle as! MockAXWindow
+        pressed.append(w.cgID)
+        if let onPress { return onPress(w) }
+        remove(w.cgID)
+        return .success
+    }
+
+    func refreshAXInfo(_ ref: AXWindowRef, timeout: Float) -> AXWindowInfo? {
+        let w = ref.handle as! MockAXWindow
+        return w.alive ? w.info : nil
+    }
+
+    func sleep(_ seconds: Double) {
+        clock += seconds
+        let due = timeline.filter { $0.0 <= clock }
+        timeline.removeAll { $0.0 <= clock }
+        for (_, f) in due { f() }
+    }
+
+    func now() -> TimeInterval { clock }
+}
+
+var passed = 0
+var failed = 0
+func check(_ name: String, _ cond: Bool, _ detail: @autoclosure () -> String = "") {
+    if cond {
+        passed += 1
+        print("  ✓ \(name)")
+    } else {
+        failed += 1
+        print("  ✗ \(name) \(detail())")
+    }
+}
+
+func r(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat = 400, _ h: CGFloat = 300) -> CGRect { CGRect(x: x, y: y, width: w, height: h) }
+
+func executor(_ b: MockBackend) -> CloseExecutor {
+    let e = CloseExecutor(backend: b)
+    return e
+}
+
+func outcomeName(_ o: CloseOutcome) -> String { "\(o.status.category)：\(o.status.detail)" }
+
+@main
+enum CoreChecks {
+    static func main() {
+        print("配对规则")
+        do {
+            let t = CGWindowInfo(windowID: 1, pid: 10, ownerName: "A", title: "文档", bounds: r(100, 100))
+            check("位置尺寸一致且唯一 → 唯一配对",
+                  WindowMatcher.match(target: t, peers: [t], axWindows: [AXWindowInfo(title: "文档", frame: r(100, 100))]) == .unique(axIndex: 0, usedTitle: false))
+            check("误差 0.5 点仍可配对",
+                  WindowMatcher.match(target: t, peers: [t], axWindows: [AXWindowInfo(title: "x", frame: r(100.5, 99.5))]) == .unique(axIndex: 0, usedTitle: false))
+            check("偏差 3 点 → 找不到（不放宽）",
+                  WindowMatcher.match(target: t, peers: [t], axWindows: [AXWindowInfo(title: "文档", frame: r(103, 100))]) == .notFound)
+            let scaled = CGWindowInfo(windowID: 1, pid: 10, ownerName: "A", title: "文档", bounds: CGRect(x: 105, y: 103, width: 392, height: 294))
+            check("打开动画中的 98% 缩放边界 → 找不到（宁可不配对）",
+                  WindowMatcher.match(target: scaled, peers: [scaled], axWindows: [AXWindowInfo(title: "文档", frame: r(100, 100))]) == .notFound)
+
+            let p2 = CGWindowInfo(windowID: 2, pid: 10, ownerName: "A", title: "另一个", bounds: r(100, 100))
+            let axs = [AXWindowInfo(title: "另一个", frame: r(100, 100)), AXWindowInfo(title: "文档", frame: r(100, 100))]
+            check("两个窗口完全重叠但标题不同 → 借助标题唯一配对到正确的那个",
+                  WindowMatcher.match(target: t, peers: [t, p2], axWindows: axs) == .unique(axIndex: 1, usedTitle: true))
+            let p2same = CGWindowInfo(windowID: 2, pid: 10, ownerName: "A", title: "文档", bounds: r(100, 100))
+            let axSame = [AXWindowInfo(title: "文档", frame: r(100, 100)), AXWindowInfo(title: "文档", frame: r(100, 100))]
+            if case .ambiguous = WindowMatcher.match(target: t, peers: [t, p2same], axWindows: axSame) { check("完全重叠且同名 → 无法唯一确认", true) } else { check("完全重叠且同名 → 无法唯一确认", false) }
+            let tNoTitle = CGWindowInfo(windowID: 1, pid: 10, ownerName: "A", title: nil, bounds: r(100, 100))
+            let p2NoTitle = CGWindowInfo(windowID: 2, pid: 10, ownerName: "A", title: nil, bounds: r(100, 100))
+            if case .ambiguous = WindowMatcher.match(target: tNoTitle, peers: [tNoTitle, p2NoTitle], axWindows: axs) { check("重叠且读不到标题（无屏幕录制）→ 无法唯一确认", true) } else { check("重叠且读不到标题 → 无法唯一确认", false) }
+            let axMin = [AXWindowInfo(title: "文档", frame: r(100, 100), isMinimized: true), AXWindowInfo(title: "文档", frame: r(100, 100))]
+            check("同位置的最小化窗口不参与配对",
+                  WindowMatcher.match(target: t, peers: [t], axWindows: axMin) == .unique(axIndex: 1, usedTitle: false))
+            if case .ambiguous = WindowMatcher.match(target: t, peers: [t, p2NoTitle], axWindows: [AXWindowInfo(title: "文档", frame: r(100, 100))]) {
+                check("辅助功能只列出一个，但屏幕上有两个同位置窗口且其中一个无标题 → 无法唯一确认", true)
+            } else { check("屏幕上有两个同位置窗口且其中一个无标题 → 无法唯一确认", false) }
+            let otherPID = CGWindowInfo(windowID: 3, pid: 11, ownerName: "B", title: "文档", bounds: r(100, 100))
+            check("其他应用的同位置同名窗口不影响配对",
+                  WindowMatcher.match(target: t, peers: [t, otherPID], axWindows: [AXWindowInfo(title: "文档", frame: r(100, 100))]) == .unique(axIndex: 0, usedTitle: false))
+        }
+
+        print("关闭流程")
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "A1", frame: r(0, 0))
+            b.add(2, pid: 10, title: "A2", frame: r(50, 50))
+            b.add(3, pid: 11, title: "B1", frame: r(0, 0))
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "A1"))
+            if case .closed(.destroyed) = o { check("正常关闭 → 已关闭", true) } else { check("正常关闭 → 已关闭", false, outcomeName(o)) }
+            check("只按了目标窗口的关闭按钮", b.pressed == [1], "\(b.pressed)")
+            check("同应用的其他窗口和其他应用的窗口都还在", b.windows[2] != nil && b.windows[3] != nil)
+        }
+        do {
+            let b = MockBackend()
+            b.add(2, pid: 10, title: "A2", frame: r(50, 50))
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "A1"))
+            if case .skipped(.windowGone) = o { check("执行前窗口已消失 → 已跳过，不按任何按钮", b.pressed.isEmpty) } else { check("窗口已消失 → 已跳过", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(5, pid: 10, title: "旧", frame: r(0, 0))
+            b.remove(5)
+            b.add(6, pid: 10, title: "旧", frame: r(0, 0)) // 原位置出现同名新窗口（新编号）
+            let o = executor(b).attempt(CloseTarget(windowID: 5, pid: 10, appName: "A", title: "旧"))
+            if case .skipped(.windowGone) = o { check("窗口被同名同位置的新窗口替换 → 跳过，不碰新窗口", b.pressed.isEmpty && b.windows[6] != nil) } else { check("窗口被替换 → 跳过", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 99, title: "别的应用", frame: r(0, 0))
+            b.running.insert(10)
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "A1"))
+            if case .skipped(.ownerChanged) = o { check("窗口编号归属变了 → 跳过", b.pressed.isEmpty) } else { check("归属变化 → 跳过", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "A1", frame: r(0, 0))
+            b.unresponsive.insert(10)
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "A1"))
+            if case .skipped(.appUnresponsive) = o { check("应用无响应 → 跳过，不发送关闭请求", b.pressed.isEmpty) } else { check("应用无响应 → 跳过", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "A1", frame: r(0, 0))
+            b.trusted = false
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "A1"))
+            if case .failed(.notTrusted) = o { check("没有辅助功能权限 → 关闭失败（不假报成功）", b.pressed.isEmpty) } else { check("无权限 → 失败", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "同名", frame: r(0, 0))
+            b.add(2, pid: 10, title: "同名", frame: r(0, 0))
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "同名"))
+            if case .skipped(.notUniquelyIdentified) = o { check("同名且重叠 → 跳过，一个都不按", b.pressed.isEmpty) } else { check("同名重叠 → 跳过", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "同名", frame: r(0, 0))
+            b.add(2, pid: 10, title: "同名", frame: r(300, 0))
+            let o = executor(b).attempt(CloseTarget(windowID: 2, pid: 10, appName: "A", title: "同名"))
+            if case .closed = o { check("同名不同位置 → 只关闭选中的那个", b.pressed == [2] && b.windows[1] != nil) } else { check("同名不同位置", false, outcomeName(o)) }
+        }
+        do {
+            // 用户在总览打开后移动了窗口：重新配对使用最新位置
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "A1", frame: r(0, 0))
+            b.windows[1]!.bounds = r(200, 200)
+            b.ax[10]![0].info.frame = r(200, 200)
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "A1"))
+            if case .closed = o { check("总览打开后窗口被移动 → 按最新位置重新核对后关闭", b.pressed == [1]) } else { check("窗口被移动", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "A1", frame: r(0, 0), ax: AXWindowInfo(title: "A1", frame: r(0, 0), closeButtonEnabled: false))
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "A1"))
+            if case .skipped(.closeButtonDisabled) = o { check("关闭按钮不可用 → 跳过", b.pressed.isEmpty) } else { check("按钮不可用", false, outcomeName(o)) }
+            let b2 = MockBackend()
+            b2.add(1, pid: 10, title: "A1", frame: r(0, 0), ax: AXWindowInfo(title: "A1", frame: r(0, 0), hasCloseButton: false))
+            let o2 = executor(b2).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "A1"))
+            if case .skipped(.noCloseButton) = o2 { check("没有关闭按钮 → 跳过", b2.pressed.isEmpty) } else { check("无关闭按钮", false, outcomeName(o2)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "A1", frame: r(0, 0))
+            let e = executor(b)
+            e.allowedPIDs = [99]
+            let o = e.attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "A1"))
+            if case .skipped(.notAllowed) = o { check("自检白名单外的窗口 → 不处理", b.pressed.isEmpty) } else { check("白名单", false, outcomeName(o)) }
+        }
+
+        print("关闭后的观察")
+        do {
+            // 弹出表单（新窗口）
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "未保存", frame: r(0, 0))
+            b.onPress = { _ in
+                b.windows[50] = CGWindowInfo(windowID: 50, pid: 10, ownerName: "A", title: "", bounds: r(20, 30, 360, 160))
+                return .success
+            }
+            let e = executor(b)
+            let o = e.attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "未保存"))
+            guard case .needsUser(let ctx) = o else { check("弹出确认框 → 等待你处理", false, outcomeName(o)); return }
+            check("弹出确认框 → 等待你处理（不自动点任何按钮）", ctx.kind == .dialogWindow && b.windows[1] != nil)
+            check("确认框仍在 → 继续等待", e.checkPending(ctx) == .stillWaiting)
+            b.windows[50] = nil
+            check("用户点“取消”，确认框消失、窗口仍在 → 判为保留", e.checkPending(ctx) == .keptOpen)
+            b.remove(1)
+            check("用户点“不保存”，窗口消失 → 判为已关闭", e.checkPending(ctx) == .closed)
+        }
+        do {
+            // 辅助功能报告表单（没有新窗口）
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "未保存", frame: r(0, 0))
+            b.onPress = { w in w.info.hasSheet = true; return .success }
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "未保存"))
+            if case .needsUser(let ctx) = o { check("窗口挂上表单 → 等待你处理", ctx.kind == .sheet) } else { check("表单", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "拒绝", frame: r(0, 0))
+            b.onPress = { _ in .success }
+            let e = executor(b)
+            let o = e.attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "拒绝"))
+            if case .failed(.stillOpen) = o { check("请求发送成功但窗口没关 → 关闭失败（不报成功）", b.clock >= e.observeTimeout) } else { check("请求成功≠关闭", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "卡住", frame: r(0, 0))
+            b.onPress = { _ in .timedOut }
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "卡住"))
+            if case .failed(.unresponsiveAfterPress) = o { check("按下时应用卡住且窗口仍在 → 关闭失败（应用无响应）", true) } else { check("按下时卡住", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "慢", frame: r(0, 0))
+            b.onPress = { _ in
+                b.timeline.append((b.clock + 1.0, { b.remove(1) }))
+                return .success
+            }
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "慢"))
+            if case .closed(.destroyed) = o { check("应用 1 秒后才关闭 → 等到真正消失后标为已关闭", b.clock >= 1.0) } else { check("慢关闭", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "收起", frame: r(0, 0))
+            b.onPress = { _ in b.windows[1]!.isOnScreen = false; return .success }
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "收起"))
+            if case .closed(.removedFromScreen) = o { check("应用关闭时只把窗口收起（窗口对象保留）→ 已关闭，并注明", true) } else { check("收起", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "最后", frame: r(0, 0))
+            b.onPress = { _ in .timedOut }
+            b.timeline.append((2.5, { b.remove(1) }))
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "最后"))
+            if case .closed = o { check("请求超时但窗口随后消失 → 已关闭（以观察结果为准）", true) } else { check("超时后关闭", false, outcomeName(o)) }
+        }
+
+        print("退出应用")
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "A1", frame: r(0, 0))
+            b.add(2, pid: 11, title: "B1", frame: r(0, 0))
+            let o = QuitExecutor(backend: b).attempt(QuitTarget(pid: 10, appName: "A"))
+            if case .quit = o { check("正常退出 → 已退出，只向目标应用发了退出请求", b.quitRequests == [10] && b.running.contains(11)) } else { check("正常退出", false, "\(o.status)") }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "未保存", frame: r(0, 0))
+            b.onTerminate = { _ in
+                b.windows[60] = CGWindowInfo(windowID: 60, pid: 10, ownerName: "A", title: "", bounds: r(20, 30, 360, 160))
+                return true
+            }
+            let e = QuitExecutor(backend: b)
+            let o = e.attempt(QuitTarget(pid: 10, appName: "A"))
+            guard case .needsUser(let ctx) = o else { check("退出前弹出确认框 → 等待你处理", false, "\(o.status)"); return }
+            check("退出前弹出确认框 → 等待你处理（不替你点按钮）", b.running.contains(10))
+            check("确认框还在 → 继续等待", e.checkPending(ctx) == .stillWaiting)
+            b.windows[60] = nil
+            check("你点了“取消”，应用继续运行 → 判为取消退出", e.checkPending(ctx) == .keptOpen)
+            b.running.remove(10)
+            check("你确认后应用退出 → 判为已退出", e.checkPending(ctx) == .closed)
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "闪一下", frame: r(0, 0))
+            b.onTerminate = { _ in
+                b.windows[61] = CGWindowInfo(windowID: 61, pid: 10, ownerName: "A", title: "", bounds: r(20, 30, 360, 160))
+                b.timeline.append((b.clock + 0.15, { b.windows[61] = nil; b.running.remove(10) }))
+                return true
+            }
+            let o = QuitExecutor(backend: b).attempt(QuitTarget(pid: 10, appName: "A"))
+            if case .quit = o { check("退出时一闪而过的窗口不误判为确认框", true) } else { check("一闪而过的窗口", false, "\(o.status)") }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "卡住", frame: r(0, 0))
+            b.onTerminate = { _ in true }
+            let e = QuitExecutor(backend: b)
+            let o = e.attempt(QuitTarget(pid: 10, appName: "A"))
+            if case .failed = o { check("应用一直不退出 → 未退出（不强制退出、不报成功）", b.running.contains(10) && b.clock >= e.timeout) } else { check("不退出", false, "\(o.status)") }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "A1", frame: r(0, 0))
+            let e = QuitExecutor(backend: b)
+            e.allowedPIDs = [99]
+            let o = e.attempt(QuitTarget(pid: 10, appName: "A"))
+            if case .skipped = o { check("自检白名单外的应用 → 不发退出请求", b.quitRequests.isEmpty) } else { check("白名单", false, "\(o.status)") }
+            let o2 = QuitExecutor(backend: b).attempt(QuitTarget(pid: 77, appName: "已退出"))
+            if case .skipped = o2 { check("应用已经不在运行 → 跳过", b.quitRequests.isEmpty) } else { check("已不在运行", false, "\(o2.status)") }
+        }
+        do {
+            // 关闭窗口的流程里绝不会发出退出请求
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "A1", frame: r(0, 0))
+            b.onPress = { _ in .success }
+            _ = CloseExecutor(backend: b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "A1"))
+            check("关闭窗口（即使关不掉）也不会退出应用", b.quitRequests.isEmpty)
+        }
+
+        print("浏览器标签页")
+        do {
+            final class MockTabs: TabsBackend {
+                var tabs: [String: [String]] = ["W1": ["t1", "t2", "t3"], "W2": ["t9"]]
+                var permitted = true
+                var closed: [String] = []
+                var onClose: ((TabKey) -> Void)?
+                func permission(pid: pid_t, ask: Bool) -> AutomationPermission { permitted ? .granted : .denied }
+                func windows(pid: pid_t) -> Result<[BrowserWindowInfo], TabsError> { .success([]) }
+                func tabIDs(pid: pid_t, windowID: String) -> Result<[String], TabsError> {
+                    guard permitted else { return .failure(.notPermitted) }
+                    guard let t = tabs[windowID] else { return .failure(.windowGone) }
+                    return .success(t)
+                }
+                func closeTab(_ key: TabKey) -> Result<Void, TabsError> {
+                    closed.append(key.tabID)
+                    if let onClose { onClose(key) } else {
+                        tabs[key.windowID]?.removeAll { $0 == key.tabID }
+                        if tabs[key.windowID]?.isEmpty == true { tabs[key.windowID] = nil }
+                    }
+                    return .success(())
+                }
+            }
+            let b = MockBackend(); b.running.insert(10)
+            let m = MockTabs()
+            let c = TabCloser(tabs: m, windows: b)
+            let o = c.attempt(TabKey(pid: 10, windowID: "W1", tabID: "t2"))
+            if case .closed(let wc) = o { check("按编号关闭标签页 → 只关掉这一个", !wc && m.closed == ["t2"] && m.tabs["W1"] == ["t1", "t3"]) } else { check("关闭标签页", false, "\(o.status)") }
+            let o2 = c.attempt(TabKey(pid: 10, windowID: "W1", tabID: "t2"))
+            if case .skipped = o2 { check("标签页已经不存在 → 跳过，不发送关闭", m.closed == ["t2"]) } else { check("已不存在", false, "\(o2.status)") }
+            let o3 = c.attempt(TabKey(pid: 10, windowID: "W2", tabID: "t9"))
+            if case .closed(let wc) = o3 { check("关掉窗口里最后一个标签页 → 标明窗口也随之关闭", wc) } else { check("最后一个标签页", false, "\(o3.status)") }
+            let o4 = c.attempt(TabKey(pid: 10, windowID: "W2", tabID: "t9"))
+            if case .skipped = o4 { check("所在窗口已经关闭 → 跳过", true) } else { check("窗口已关闭", false, "\(o4.status)") }
+            m.permitted = false
+            let o5 = c.attempt(TabKey(pid: 10, windowID: "W1", tabID: "t1"))
+            if case .failed = o5 { check("没有控制浏览器的权限 → 关闭失败（不假报成功）", !m.closed.contains("t1")) } else { check("无权限", false, "\(o5.status)") }
+            m.permitted = true
+            m.onClose = { _ in } // 网页拒绝关闭（例如弹出“离开此网站？”但没有新窗口）
+            let o6 = c.attempt(TabKey(pid: 10, windowID: "W1", tabID: "t1"))
+            if case .failed = o6 { check("发送了关闭但标签页还在 → 关闭失败（不报成功）", m.tabs["W1"]?.contains("t1") == true) } else { check("标签页仍在", false, "\(o6.status)") }
+            m.onClose = { _ in b.windows[70] = CGWindowInfo(windowID: 70, pid: 10, ownerName: "Chrome", title: "", bounds: r(100, 100, 400, 200)) }
+            let o7 = c.attempt(TabKey(pid: 10, windowID: "W1", tabID: "t3"))
+            if case .needsUser(let ctx) = o7 {
+                check("网页弹出离开确认 → 等待你处理", true)
+                b.windows[70] = nil
+                check("你点了“留下” → 判为保留", c.checkPending(ctx) == .keptOpen)
+            } else { check("离开确认", false, "\(o7.status)") }
+            let c2 = TabCloser(tabs: m, windows: b); c2.allowedPIDs = [99]
+            let o8 = c2.attempt(TabKey(pid: 10, windowID: "W1", tabID: "t1"))
+            if case .skipped = o8 { check("自检白名单外的浏览器 → 不处理", true) } else { check("白名单", false, "\(o8.status)") }
+            // 浏览器窗口与卡片的对应
+            let wins = [BrowserWindowInfo(id: "A", title: "x", boundsCandidates: [r(0, 0)], isMinimized: false, tabs: []),
+                        BrowserWindowInfo(id: "B", title: "y", boundsCandidates: [r(300, 0)], isMinimized: false, tabs: [])]
+            check("浏览器窗口按边界对应到卡片", BrowserTabSupport.matchWindow(cardBounds: r(300, 0), cardTitle: "y", in: wins)?.id == "B")
+            let same = [BrowserWindowInfo(id: "A", title: "x", boundsCandidates: [r(0, 0)], isMinimized: false, tabs: []),
+                        BrowserWindowInfo(id: "B", title: "x", boundsCandidates: [r(0, 0)], isMinimized: false, tabs: [])]
+            check("两个浏览器窗口位置和标题都相同 → 不强行对应", BrowserTabSupport.matchWindow(cardBounds: r(0, 0), cardTitle: "x", in: same) == nil)
+            let cases: [(String, String)] = [
+                ("https://mail.google.com/mail/u/0/", "google.com"), ("https://translate.google.com", "google.com"),
+                ("https://www.bilibili.com/video/x", "bilibili.com"), ("https://github.com/apple/swift", "github.com"),
+                ("https://news.sina.com.cn/a.html", "sina.com.cn"), ("https://www.bbc.co.uk/news", "bbc.co.uk"),
+                ("chrome://newtab/", BrowserTabSupport.internalPagesName), ("file:///Users/x/a.html", BrowserTabSupport.localFilesName),
+                ("http://localhost:3000/", "localhost"), ("http://192.168.1.10/admin", "192.168.1.10"), ("", BrowserTabSupport.otherName),
+            ]
+            let wrong = cases.filter { BrowserTabSupport.siteName(for: $0.0) != $0.1 }
+            check("按网站归类：子域名归到主网站、国家二级域名、内部页面、本地文件、IP", wrong.isEmpty,
+                  wrong.map { "\($0.0) → \(BrowserTabSupport.siteName(for: $0.0))" }.joined(separator: "；"))
+        }
+
+        print("窗口列表")
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "普通", frame: r(0, 0))
+            b.add(2, pid: 10, title: "菜单", frame: r(0, 0, 200, 300), layer: 101)
+            b.add(3, pid: 10, title: "小", frame: r(0, 0, 20, 20))
+            b.add(4, pid: getpid(), title: "自己", frame: r(500, 0))
+            b.add(5, pid: 11, title: "同名", frame: r(0, 0))
+            b.add(6, pid: 11, title: "同名", frame: r(0, 0))
+            b.add(7, pid: 11, title: "", frame: r(700, 0), noAX: true)
+            b.add(8, pid: 12, title: "无辅助功能", frame: r(700, 300), noAX: true)
+            let res = WindowEnumerator.enumerate(backend: b, ownPID: getpid())
+            let ids = Set(res.entries.map(\.id))
+            check("排除非普通层级窗口、过小窗口和本工具自身", !ids.contains(2) && !ids.contains(3) && !ids.contains(4))
+            check("普通窗口可选", res.entries.first { $0.id == 1 }?.isClosable == true)
+            check("同名重叠窗口显示但不可选", res.entries.filter { $0.id == 5 || $0.id == 6 }.allSatisfy { !$0.isClosable } && ids.contains(5))
+            check("没有标题、也找不到的辅助窗口不显示", !ids.contains(7))
+            check("有标题但辅助功能找不到的窗口显示为不可选", res.entries.first { $0.id == 8 }?.isClosable == false)
+            b.trusted = false
+            let res2 = WindowEnumerator.enumerate(backend: b, ownPID: getpid())
+            check("无辅助功能权限时标记为未授权，不可选", !res2.axTrusted && res2.entries.allSatisfy { !$0.isClosable })
+        }
+
+        print("\n结果：通过 \(passed) 项，未通过 \(failed) 项")
+        exit(failed == 0 ? 0 : 1)
+    }
+}

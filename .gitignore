@@ -1,0 +1,26 @@
+# Local signing identity and password — never publish
+/signing/
+*.keychain
+*.keychain-db
+*.p12
+*.pfx
+*.pem
+*.key
+keychain-password
+
+# Build outputs and local verification artifacts
+/build/
+/dist/
+/.build/
+/验证报告/
+*.app/
+*.log
+
+# Machine-local settings
+.DS_Store
+.env
+.env.*
+!.env.example
+/.claude/
+*.xcuserstate
+xcuserdata/

@@ -12,7 +12,7 @@
 最低目标系统为 macOS 14；主要开发验证环境为 Apple Silicon、macOS 27.0.1、Swift 6.4。使用 Xcode 命令行工具直接编译，不依赖 SwiftPM。固定签名生成步骤使用 OpenSSL 3 的 `-legacy` 选项；无法生成证书时脚本会尝试退回临时签名。
 
 ```bash
-git clone https://github.com/KK-invent/window-cleaner.git
+git clone https://github.com/KK-invent/-window-cleaner.git window-cleaner
 cd window-cleaner
 bash scripts/build.sh
 ```

@@ -15,9 +15,17 @@ public final class LiveBackend: WindowBackend {
         return list.compactMap(Self.parse)
     }
 
+    public func allWindows() -> [CGWindowInfo] {
+        guard let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] else { return [] }
+        return list.compactMap(Self.parse)
+    }
+
     public func windowInfo(_ id: CGWindowID) -> CGWindowInfo? {
-        // 快速路径：只对在屏幕上的窗口有效
-        if let list = CGWindowListCopyWindowInfo([.optionIncludingWindow, .optionOnScreenBelowWindow], id) as? [[String: Any]],
+        // 快速路径：只查这一个窗口（约 0.1 毫秒），在屏和不在屏的窗口都能查到
+        var raw: UnsafeRawPointer? = UnsafeRawPointer(bitPattern: UInt(id))
+        if let ids = CFArrayCreate(kCFAllocatorDefault, &raw, 1, nil),
+           let list = CGWindowListCreateDescriptionFromArray(ids) as? [[String: Any]],
            let w = list.compactMap(Self.parse).first(where: { $0.windowID == id }) {
             return w
         }
@@ -48,16 +56,78 @@ public final class LiveBackend: WindowBackend {
     }
 
     public func isAppRunning(_ pid: pid_t) -> Bool {
-        guard let app = NSRunningApplication(processIdentifier: pid) else { return false }
-        return !app.isTerminated
+        // 直接问系统进程是否还在（信号 0 只做检查，不发送任何信号）。
+        // 实测：几个应用并行退出时，在后台线程同时创建 NSRunningApplication 偶尔会对仍在运行的应用返回空，
+        // 会把“正在显示保存提示”的应用误判为已退出；系统调用没有这个问题。
+        guard pid > 0 else { return false }
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    public func isAppHidden(_ pid: pid_t) -> Bool {
+        NSRunningApplication(processIdentifier: pid)?.isHidden ?? false
     }
 
     public func terminateApp(_ pid: pid_t) -> Bool {
         // 正常退出（不是强制退出）：应用会照常询问是否保存，也可以拒绝
-        NSRunningApplication(processIdentifier: pid)?.terminate() ?? false
+        // 并行退出时偶尔取不到应用对象：稍等重试，不把“没取到”当成拒绝
+        for attempt in 0..<5 {
+            if let app = NSRunningApplication(processIdentifier: pid) { return app.terminate() }
+            if !isAppRunning(pid) { return false }
+            if attempt < 4 { Thread.sleep(forTimeInterval: 0.01) }
+        }
+        return false
     }
 
     // MARK: 辅助功能
+
+    public func appHasDialog(pid: pid_t, timeout: Float) -> Result<Bool, AXAccessError> {
+        guard AXIsProcessTrusted() else { return .failure(.notTrusted) }
+        let deadline = now() + Double(timeout)
+        // 每次系统调用都使用剩余预算，避免多窗口 × 多属性 × 超时不断累加。
+        func read(_ element: AXUIElement, _ attribute: String) -> Result<CFTypeRef?, AXAccessError> {
+            guard isAppRunning(pid) else { return .failure(.appGone) }
+            let remaining = deadline - now()
+            guard remaining > 0 else { return .failure(.appUnresponsive) }
+            AXUIElementSetMessagingTimeout(element, Float(remaining))
+            var value: CFTypeRef?
+            let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+            switch error {
+            case .success: return .success(value)
+            case .noValue, .attributeUnsupported: return .success(nil)
+            case .cannotComplete: return .failure(.appUnresponsive)
+            case .apiDisabled: return .failure(.notTrusted)
+            case .invalidUIElement: return .failure(.appGone)
+            default: return .failure(.other(error.rawValue))
+            }
+        }
+        let app = AXUIElementCreateApplication(pid)
+        let windows: [AXUIElement]
+        switch read(app, kAXWindowsAttribute) {
+        case .success(let value): windows = (value as? [AXUIElement]) ?? []
+        case .failure(let error): return .failure(error)
+        }
+        for window in windows {
+            switch read(window, kAXModalAttribute) {
+            case .success(let value):
+                if (value as? NSNumber)?.boolValue == true { return .success(true) }
+            case .failure(let error): return .failure(error)
+            }
+            let children: [AXUIElement]
+            switch read(window, kAXChildrenAttribute) {
+            case .success(let value): children = (value as? [AXUIElement]) ?? []
+            case .failure(let error): return .failure(error)
+            }
+            for child in children {
+                switch read(child, kAXRoleAttribute) {
+                case .success(let value):
+                    if (value as? String) == (kAXSheetRole as String) { return .success(true) }
+                case .failure(let error): return .failure(error)
+                }
+            }
+        }
+        return .success(false)
+    }
 
     public func axWindows(pid: pid_t, timeout: Float, includeSheetCheck: Bool) -> Result<[AXWindowRef], AXAccessError> {
         guard AXIsProcessTrusted() else { return .failure(.notTrusted) }
@@ -66,14 +136,20 @@ public final class LiveBackend: WindowBackend {
         var value: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
         switch err {
-        case .success: break
-        case .noValue, .attributeUnsupported: return .success([])
+        case .success, .noValue, .attributeUnsupported: break
         case .cannotComplete: return .failure(isAppRunning(pid) ? .appUnresponsive : .appGone)
         case .apiDisabled: return .failure(.notTrusted)
         case .invalidUIElement: return .failure(.appGone)
         default: return .failure(.other(err.rawValue))
         }
-        guard let elements = value as? [AXUIElement] else { return .success([]) }
+        var elements = (value as? [AXUIElement]) ?? []
+        // 部分应用在其他桌面把 AXWindows 报为空，但仍提供主窗口或焦点窗口。
+        // 这两个同样是公开属性；用元素身份去重，不靠标题推测窗口是否还在。
+        for attribute in [kAXMainWindowAttribute, kAXFocusedWindowAttribute] {
+            if let extra = Self.element(app, attribute), !elements.contains(where: { CFEqual($0, extra) }) {
+                elements.append(extra)
+            }
+        }
         var result: [AXWindowRef] = []
         for element in elements {
             AXUIElementSetMessagingTimeout(element, timeout)
@@ -87,6 +163,13 @@ public final class LiveBackend: WindowBackend {
         let element = ref.handle as! AXUIElement
         AXUIElementSetMessagingTimeout(element, timeout)
         return Self.readInfo(element, timeout: timeout, includeSheetCheck: true)
+    }
+
+    public func axWindowIsGone(_ ref: AXWindowRef, timeout: Float) -> Bool {
+        let element = ref.handle as! AXUIElement
+        AXUIElementSetMessagingTimeout(element, timeout)
+        var value: CFTypeRef?
+        return AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value) == .invalidUIElement
     }
 
     public func pressCloseButton(of ref: AXWindowRef, timeout: Float) -> AXActionResult {

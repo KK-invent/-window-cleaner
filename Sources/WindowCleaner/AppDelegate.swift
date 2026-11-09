@@ -4,6 +4,45 @@ import AppKit
 enum WindowCleanerMain {
     static func main() {
         let app = NSApplication.shared
+        // 开发用只读诊断，不弹总览、不关闭任何窗口，也不写标题或截图。
+        let args = CommandLine.arguments
+        if args.count == 3, args[1] == "--window-scope-report" {
+            app.setActivationPolicy(.prohibited)
+            let backend = LiveBackend()
+            let raw = backend.allWindows().filter { $0.layer == 0 && $0.pid != getpid() }
+            var axLists: [pid_t: [AXWindowRef]] = [:]
+            for pid in Set(raw.map(\.pid)) {
+                if case .success(let list) = backend.axWindows(pid: pid, timeout: 0.3, includeSheetCheck: false) { axLists[pid] = list }
+            }
+            let report: [String: Any] = [
+                "accessibility": Permissions.accessibility,
+                "currentCount": WindowEnumerator.enumerate(backend: backend, ownPID: getpid(), scope: .currentDesktop).entries.count,
+                "rawWindows": raw.map { window -> [String: Any] in
+                    var count = 0
+                    var roles: [String] = []
+                    var match = "读取失败"
+                    if let list = axLists[window.pid] {
+                        count = list.count
+                        roles = list.map { $0.info.subrole ?? "无subrole" }
+                        match = String(describing: WindowMatcher.match(target: window, peers: raw.filter { $0.pid == window.pid }, axWindows: list.map(\.info)))
+                    }
+                    return ["id": window.windowID, "pid": window.pid, "onScreen": window.isOnScreen,
+                            "titleLength": window.title?.count ?? 0, "axCount": count, "subroles": roles, "match": match]
+                },
+                "entries": WindowEnumerator.enumerate(backend: backend, ownPID: getpid(), scope: .allDesktops).entries.map {
+                    ["id": $0.id, "pid": $0.pid, "onScreen": $0.isOnScreen, "closable": $0.isClosable,
+                     "minimized": $0.isMinimized, "hidden": $0.isAppHidden] as [String: Any]
+                }
+            ]
+            do {
+                let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+                try data.write(to: URL(fileURLWithPath: args[2]), options: .atomic)
+            } catch {
+                FileHandle.standardError.write(Data("窗口范围诊断失败：\(error)\n".utf8))
+                exit(1)
+            }
+            return
+        }
         let delegate = AppDelegate()
         app.delegate = delegate
         app.setActivationPolicy(.regular)
@@ -68,7 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidBecomeActive(_ notification: Notification) {
         guard launched, selfTest == nil else { return }
         // 自检报告窗口开着时，切回本应用是为了看报告，不自动弹出总览
-        if NSApp.windows.contains(where: { $0.isVisible && $0.title == "窗口清理 · 自检" }) { return }
+        if NSApp.windows.contains(where: { $0.isVisible && $0.title == "扫把 · 自检" }) { return }
         if !controller.isOverlayVisible && !controller.isBusy && !controller.isWaitingForPermission {
             controller.show(reason: "切换到本应用")
         }
@@ -85,15 +124,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let main = NSMenu()
         let appItem = NSMenuItem()
         main.addItem(appItem)
-        let m = NSMenu(title: "窗口清理")
-        m.addItem(withTitle: "关于窗口清理", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        let m = NSMenu(title: "扫把")
+        m.addItem(withTitle: "关于扫把", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         m.addItem(.separator())
         let show = NSMenuItem(title: "显示窗口总览", action: #selector(showOverview), keyEquivalent: "o")
         show.target = self
         m.addItem(show)
         m.addItem(.separator())
-        m.addItem(withTitle: "隐藏窗口清理", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        m.addItem(withTitle: "退出窗口清理", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        m.addItem(withTitle: "隐藏扫把", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        m.addItem(withTitle: "退出扫把", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = m
         NSApp.mainMenu = main
     }

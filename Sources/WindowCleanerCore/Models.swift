@@ -88,12 +88,15 @@ public struct CloseTarget: Equatable, Sendable {
     public var pid: pid_t
     public var appName: String
     public var title: String
+    /// 来自“全部桌面”的目标，允许对当前屏幕以外的窗口重新匹配。
+    public var allowOffscreen: Bool
 
-    public init(windowID: CGWindowID, pid: pid_t, appName: String, title: String) {
+    public init(windowID: CGWindowID, pid: pid_t, appName: String, title: String, allowOffscreen: Bool = false) {
         self.windowID = windowID
         self.pid = pid
         self.appName = appName
         self.title = title
+        self.allowOffscreen = allowOffscreen
     }
 }
 
@@ -110,12 +113,15 @@ public struct PendingContext {
     /// 按下关闭按钮之前，该应用已在屏幕上的窗口编号；之后多出来的就是对话框。
     public var baseline: Set<CGWindowID>
     public var windowRef: AXWindowRef
+    /// 原本就在其他桌面的窗口，不能凭“不在屏幕上”认定已关闭。
+    public var wasOnScreen: Bool
 
-    public init(target: CloseTarget, kind: Kind, baseline: Set<CGWindowID>, windowRef: AXWindowRef) {
+    public init(target: CloseTarget, kind: Kind, baseline: Set<CGWindowID>, windowRef: AXWindowRef, wasOnScreen: Bool = true) {
         self.target = target
         self.kind = kind
         self.baseline = baseline
         self.windowRef = windowRef
+        self.wasOnScreen = wasOnScreen
     }
 }
 

@@ -4,7 +4,7 @@ import AppKit
 import ScriptingBridge
 
 // 浏览器标签页：读取 Chrome（及同样提供 Chrome 脚本接口的浏览器）窗口里的标签页，按标签页编号关闭指定标签页。
-// 使用浏览器自带的公开脚本接口（Apple Events / ScriptingBridge），需要你允许“窗口清理”控制该浏览器（系统会询问一次）。
+// 使用浏览器自带的公开脚本接口（Apple Events / ScriptingBridge），需要你允许“扫把”控制该浏览器（系统会询问一次）。
 // 标签页以浏览器内部的唯一编号识别，不靠标题匹配；关闭前再次确认编号仍在，关闭后观察它是否真的消失。
 
 public struct BrowserTab: Equatable, Sendable, Identifiable {
@@ -12,12 +12,14 @@ public struct BrowserTab: Equatable, Sendable, Identifiable {
     public var title: String
     public var url: String
     public var isActive: Bool
+    public var isLoading: Bool
 
-    public init(id: String, title: String, url: String, isActive: Bool) {
+    public init(id: String, title: String, url: String, isActive: Bool, isLoading: Bool = false) {
         self.id = id
         self.title = title
         self.url = url
         self.isActive = isActive
+        self.isLoading = isLoading
     }
 
     /// 只显示网址的主机部分
@@ -75,6 +77,19 @@ public protocol TabsBackend: AnyObject {
     func windows(pid: pid_t) -> Result<[BrowserWindowInfo], TabsError>
     func tabIDs(pid: pid_t, windowID: String) -> Result<[String], TabsError>
     func closeTab(_ key: TabKey) -> Result<Void, TabsError>
+    func activeTab(pid: pid_t, windowID: String) -> Result<BrowserTab, TabsError>
+}
+
+public extension TabsBackend {
+    func activeTab(pid: pid_t, windowID: String) -> Result<BrowserTab, TabsError> {
+        switch windows(pid: pid) {
+        case .failure(let error): return .failure(error)
+        case .success(let list):
+            guard let window = list.first(where: { $0.id == windowID }) else { return .failure(.windowGone) }
+            guard let tab = window.tabs.first(where: \.isActive) else { return .failure(.failed(-1728)) }
+            return .success(tab)
+        }
+    }
 }
 
 public enum BrowserTabSupport {
@@ -291,6 +306,7 @@ public final class LiveTabsBackend: TabsBackend {
             if catcher.code != 0 { continue }
             let titles = Self.strings(tabs.array(byApplying: NSSelectorFromString("title")))
             let urls = Self.strings(tabs.array(byApplying: NSSelectorFromString("URL")))
+            let loading = tabs.array(byApplying: NSSelectorFromString("loading"))
             let activeIndex = (w.value(forKey: "activeTabIndex") as? NSNumber)?.intValue ?? 0
             var candidates: [CGRect] = []
             if let b = bounds[safe: i] {
@@ -308,7 +324,8 @@ public final class LiveTabsBackend: TabsBackend {
                 }
             }
             let tabsList = tabIDs.enumerated().map { j, tid in
-                BrowserTab(id: tid, title: titles[safe: j] ?? "", url: urls[safe: j] ?? "", isActive: j + 1 == activeIndex)
+                BrowserTab(id: tid, title: titles[safe: j] ?? "", url: urls[safe: j] ?? "", isActive: j + 1 == activeIndex,
+                           isLoading: (loading[safe: j] as? NSNumber)?.boolValue ?? false)
             }
             result.append(BrowserWindowInfo(id: wid, title: names[safe: i] ?? "", boundsCandidates: candidates,
                                             isMinimized: (minimized[safe: i] as? NSNumber)?.boolValue ?? false, tabs: tabsList))
@@ -332,6 +349,22 @@ public final class LiveTabsBackend: TabsBackend {
             if catcher.code == 0 { return w }
         }
         return nil
+    }
+
+    public func activeTab(pid: pid_t, windowID: String) -> Result<BrowserTab, TabsError> {
+        let catcher = SBErrorCatcher()
+        guard let app = app(pid, catcher) else { return .failure(.appNotRunning) }
+        guard let w = window(app, catcher, id: windowID) else {
+            return .failure(catcher.code == 0 ? .windowGone : mapError(catcher.code))
+        }
+        catcher.code = 0
+        guard let tab = w.value(forKey: "activeTab") as? SBObject else { return .failure(mapError(catcher.code)) }
+        let id = tab.value(forKey: "id").map { "\($0)" } ?? ""
+        let url = tab.value(forKey: "URL") as? String ?? ""
+        let title = tab.value(forKey: "title") as? String ?? ""
+        let loading = (tab.value(forKey: "loading") as? NSNumber)?.boolValue ?? false
+        guard catcher.code == 0, !id.isEmpty else { return .failure(mapError(catcher.code)) }
+        return .success(BrowserTab(id: id, title: title, url: url, isActive: true, isLoading: loading))
     }
 
     public func tabIDs(pid: pid_t, windowID: String) -> Result<[String], TabsError> {

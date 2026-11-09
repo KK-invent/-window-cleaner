@@ -3,7 +3,7 @@ import SwiftUI
 
 /// 覆盖全屏的总览窗口。无边框窗口默认不能成为键盘焦点，这里放开以便接收 Esc。
 /// 总览显示期间请系统隐藏程序坞和菜单栏（全屏应用的标准做法），鼠标移到屏幕底部不会让程序坞放大或弹出；
-/// 总览收起后立即恢复。这个设置只在窗口清理处于前台时生效。
+/// 总览收起后立即恢复。这个设置只在扫把处于前台时生效。
 final class OverlayWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -65,26 +65,35 @@ final class OverviewController: NSObject {
     private var loadGeneration = 0
 
     var isOverlayVisible: Bool { overlay?.isVisible == true }
-    var isBusy: Bool { model.phase == .running || model.phase == .paused || workerRunning }
+    var isBusy: Bool { model.phase == .running || model.phase == .paused || laneBusy }
     var isWaitingForPermission: Bool { panel?.isVisible == true && model.phase == .needsPermission }
 
     lazy var actions = OverviewActions(
-        cardClicked: { [weak self] e in self?.cardClicked(e) },
-        appClicked: { [weak self] a in self?.appClicked(a) },
-        tabClicked: { [weak self] k in self?.tabClicked(k) },
+        cardClicked: { [weak self] e in if self?.isReflowing == false { self?.cardClicked(e) } },
+        appClicked: { [weak self] a in if self?.isReflowing == false { self?.appClicked(a) } },
+        tabClicked: { [weak self] k in if self?.isReflowing == false { self?.tabClicked(k) } },
         tabMarqueeFinished: { [weak self] ks in self?.tabMarqueeFinished(ks) },
         closeTabGroup: { [weak self] ks in self?.closeTabGroup(ks) },
         appMarqueeFinished: { [weak self] list in self?.appMarqueeFinished(list) },
         switchPage: { [weak self] p in self?.switchPage(p) },
         requestTabsPermission: { [weak self] in self?.requestTabsPermission() },
         openAutomationSettings: { [weak self] in self?.openAutomationSettings() },
-        reloadTabs: { [weak self] in self?.loadTabs() },
+        reloadTabs: { [weak self] in
+            self?.faviconStore.invalidate()
+            self?.loadTabs()
+        },
+        chooseFaviconFolder: { [weak self] bundle in self?.chooseFaviconFolder(bundleID: bundle) },
         backgroundClicked: { [weak self] in self?.backgroundClicked() },
         marqueeFinished: { [weak self] list in self?.marqueeFinished(list) },
         dismiss: { [weak self] in self?.dismiss(hideApp: true, animated: true) },
         closeSelected: { [weak self] in self?.startClosing() },
         stop: { [weak self] in self?.model.stopRequested = true },
         refresh: { [weak self] in self?.reload(reason: "刷新", t0: CACurrentMediaTime()) },
+        setWindowScope: { [weak self] scope in
+            guard let self, !self.isBusy else { return }
+            self.model.windowScope = scope
+            self.reload(reason: "切换窗口范围", t0: CACurrentMediaTime())
+        },
         finish: { [weak self] in self?.dismiss(hideApp: true, animated: true) },
         openAccessibility: { [weak self] in self?.openPermissionSettings(accessibility: true) },
         openScreenRecording: { [weak self] in self?.openPermissionSettings(accessibility: false) },
@@ -122,11 +131,11 @@ final class OverviewController: NSObject {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.18
+            ctx.duration = 0.15
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             window.animator().alphaValue = 1
         }
-        animateContentScale(from: 1.035, to: 1, duration: 0.3, timing: .easeOut, keep: false)
+        animateContentScale(from: 1.03, to: 1, duration: 0.24, timing: .easeOut, keep: false)
         model.shown = true
         installKeyMonitor()
         let processMs = reason == "启动" ? TimingLog.msSinceProcessStart() : nil
@@ -146,6 +155,7 @@ final class OverviewController: NSObject {
 
     func dismiss(hideApp: Bool = true, animated: Bool = false) {
         guard !isBusy else { return }
+        model.closeFeedback.reset()
         autoDismissTask?.cancel()
         autoDismissTask = nil
         cancelLoading()
@@ -169,9 +179,9 @@ final class OverviewController: NSObject {
         if animated, let overlay, overlay.isVisible {
             model.exiting = true
             model.shown = false
-            animateContentScale(from: 1, to: 0.97, duration: 0.22, timing: .easeIn, keep: true)
+            animateContentScale(from: 1, to: 0.97, duration: 0.18, timing: .easeIn, keep: true)
             NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.22
+                ctx.duration = 0.18
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
                 overlay.animator().alphaValue = 0
             }, completionHandler: {
@@ -223,6 +233,8 @@ final class OverviewController: NSObject {
             self.overlay = nil
             self.model.thumbnails = [:]
             self.model.favicons = [:]
+            self.model.tabPreviews = [:]
+            self.tabPreviewCache.removeAll()
             // 把空出来的内存真正还给系统
             malloc_zone_pressure_relief(nil, 0)
             TimingLog.append("overlay released after idle \(TimingLog.memoryText())")
@@ -240,7 +252,7 @@ final class OverviewController: NSObject {
     func checkAutoDismiss() {
         guard allowedPIDs == nil, isOverlayVisible, model.page == .windows,
               model.phase == .selecting || model.phase == .finished,
-              !workerRunning, clickQueue.isEmpty, !model.marqueeActive else { return }
+              !laneBusy, clickQueue.isEmpty, !model.marqueeActive else { return }
         let remainingWindows = model.entries.filter { !model.vanished.contains($0.id) }
         let remainingApps = model.apps.filter { !model.vanishedApps.contains($0.id) }
         let closedAllWindows = model.summary.closed > 0 && lastActionKind == .window
@@ -250,13 +262,13 @@ final class OverviewController: NSObject {
             return
         }
         // 刚关完最后一个：等卡片淡出后退出；打开时就什么都没有：让提示停留 1 秒左右
-        let delay = closedAllWindows ? 0.45 : 1.1
+        let delay = closedAllWindows ? 0.3 : 1.1
         autoDismissTask?.cancel()
         autoDismissTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard let self, !Task.isCancelled else { return }
             let stillEmpty = self.model.entries.allSatisfy { self.model.vanished.contains($0.id) }
-            guard stillEmpty, self.isOverlayVisible, !self.workerRunning, self.clickQueue.isEmpty,
+            guard stillEmpty, self.isOverlayVisible, !self.laneBusy, self.clickQueue.isEmpty,
                   self.model.phase == .selecting || self.model.phase == .finished else { return }
             TimingLog.append("auto-dismiss reason=\(closedAllWindows ? "关完最后一个窗口" : "没有窗口也没有应用")")
             self.dismiss(hideApp: true, animated: true)
@@ -275,7 +287,7 @@ final class OverviewController: NSObject {
     }
 
     func didResignActive() {
-        if workerRunning { return }
+        if laneBusy { return }
         // 选择阶段切到别的应用（例如 Cmd-Tab），就像调度中心一样收起，不关闭任何窗口
         if isOverlayVisible && (model.phase == .selecting || model.phase == .loading || model.phase == .finished || model.phase == .needsPermission) {
             cancelLoading()
@@ -298,7 +310,7 @@ final class OverviewController: NSObject {
         w.isReleasedWhenClosed = false
         w.animationBehavior = .none
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
-        w.title = "窗口清理"
+        w.title = "扫把"
         model.onCardsVanished = { [weak self] in
             self?.scheduleCompaction()
             self?.checkAutoDismiss()
@@ -348,11 +360,11 @@ final class OverviewController: NSObject {
             model.cancelMarquee()
             return
         }
-        if workerRunning && model.phase == .selecting {
-            // 单击即关闭模式下还有排队的：取消排队中的（不再关闭），当前这个处理完后退出
+        if laneBusy && model.phase == .selecting {
+            // 单击即关闭模式下还有排队的：取消排队中的（不再关闭），正在处理的完成后退出
             for q in clickQueue { setStatus(q, nil) }
             clickQueue.removeAll()
-            model.activeCount = 1
+            updateActiveCount()
             dismissWhenIdle = true
             return
         }
@@ -379,13 +391,14 @@ final class OverviewController: NSObject {
         stopPermissionPolling()
         if model.phase != .selecting && model.phase != .finished { model.phase = .loading }
         let ownPID = getpid()
+        let scope = model.windowScope
         Task.detached(priority: .userInitiated) {
-            var result = WindowEnumerator.enumerate(backend: LiveBackend(), ownPID: ownPID)
+            var result = WindowEnumerator.enumerate(backend: LiveBackend(), ownPID: ownPID, scope: scope)
             // 刚安装新版本后，系统可能有一小段时间仍拒绝辅助功能请求：权限明明在，就稍等再读一次
             for _ in 0..<2 where !result.axTrusted && AXIsProcessTrusted() {
                 TimingLog.append("list retry: accessibility requests were refused although permission is granted")
                 try? await Task.sleep(nanoseconds: 600_000_000)
-                result = WindowEnumerator.enumerate(backend: LiveBackend(), ownPID: ownPID)
+                result = WindowEnumerator.enumerate(backend: LiveBackend(), ownPID: ownPID, scope: scope)
             }
             let finalResult = result
             await MainActor.run { [weak self] in
@@ -395,7 +408,9 @@ final class OverviewController: NSObject {
         }
     }
 
-    private func apply(_ result: WindowEnumerator.Result, reason: String, t0: CFTimeInterval, generation: Int) {
+    private func apply(_ rawResult: WindowEnumerator.Result, reason: String, t0: CFTimeInterval, generation: Int) {
+        var result = rawResult
+        if let allowedPIDs { result.entries = result.entries.filter { allowedPIDs.contains($0.pid) } }
         let listMs = (CACurrentMediaTime() - t0) * 1000
         model.reset()
         model.entries = result.entries
@@ -405,7 +420,7 @@ final class OverviewController: NSObject {
             counts[e.pid, default: 0] += 1
             if order[e.pid] == nil { order[e.pid] = i }
         }
-        model.apps = OverviewModel.runningApps(windowCounts: counts, order: order)
+        model.apps = OverviewModel.runningApps(windowCounts: counts, order: order).filter { allowedPIDs?.contains($0.id) ?? true }
         model.hasTitles = result.hasTitles
         if model.page == .browserTabs { loadTabs() }
         model.phase = .selecting
@@ -414,7 +429,7 @@ final class OverviewController: NSObject {
         var blocked: [String: Int] = [:]
         for e in result.entries { if let r = e.closability.reasonText { blocked[r, default: 0] += 1 } }
         let blockedText = blocked.isEmpty ? "" : " blocked=" + blocked.map { "\($0.key)×\($0.value)" }.joined(separator: ";")
-        TimingLog.append("show reason=\(reason) list=\(Int(listMs))ms windows=\(result.entries.count) closable=\(result.entries.filter(\.isClosable).count)\(blockedText) \(TimingLog.memoryText())")
+        TimingLog.append("show reason=\(reason) list=\(Int(listMs))ms windows=\(result.entries.count) closable=\(result.entries.filter(\.isClosable).count) scope=\(model.windowScope.rawValue) offscreen=\(result.entries.filter { !$0.isOnScreen }.count)\(blockedText) \(TimingLog.memoryText())")
         guard model.screenRecording, !result.entries.isEmpty else {
             model.thumbnailPhase = model.screenRecording ? .done : .unavailable("未授权屏幕录制")
             return
@@ -422,9 +437,10 @@ final class OverviewController: NSObject {
         model.thumbnailPhase = .loading
         let ids = result.entries.map(\.id)
         let maxPx = thumbnailPixelSize(count: result.entries.count)
+        let includeOffscreen = model.windowScope == .allDesktops
         thumbnailTask = Task { [weak self] in
             do {
-                let (ok, failed) = try await ThumbnailLoader.load(ids: ids, maxPixelSize: maxPx) { id, image in
+                let (ok, failed) = try await ThumbnailLoader.load(ids: ids, maxPixelSize: maxPx, includeOffscreen: includeOffscreen) { id, image in
                     guard let self, generation == self.loadGeneration else { return }
                     if let image { self.model.thumbnails[id] = image } else { self.model.failedThumbnails.insert(id) }
                 }
@@ -463,6 +479,8 @@ final class OverviewController: NSObject {
     }
 
     private func cancelLoading() {
+        tabPreviewTask?.cancel()
+        tabPreviewTask = nil
         thumbnailTask?.cancel()
         thumbnailTask = nil
         loadGeneration += 1
@@ -488,16 +506,35 @@ final class OverviewController: NSObject {
         lastActionKind = queue.contains { if case .app = $0 { return true }; return false } ? .app : .window
         for item in queue { setStatus(item, .queued) }
 
-        for (i, item) in queue.enumerated() {
+        // 应用同时退出（各自收尾，彼此不等）；窗口和标签页仍按选中顺序依次处理
+        let apps = queue.filter { if case .app = $0 { return true }; return false }
+        let others = queue.filter { if case .app = $0 { return false }; return true }
+        var done = 0
+        let quitGroup = Task { [weak self] in
+            await withTaskGroup(of: Void.self) { group in
+                for item in apps {
+                    group.addTask { @MainActor in
+                        guard let self else { return }
+                        let decision = await self.process(item)
+                        if decision == .stop { self.model.stopRequested = true }
+                        done += 1
+                        self.model.runIndex = done
+                    }
+                }
+            }
+        }
+        for (i, item) in others.enumerated() {
             if model.stopRequested {
                 setStatus(item, .skipped(SkipReason.stoppedByUser.text))
                 continue
             }
-            model.runIndex = i + 1
-            model.remainingCount = queue.count - i - 1
+            model.remainingCount = others.count - i - 1
             let decision = await process(item)
+            done += 1
+            model.runIndex = done
             if decision == .stop { model.stopRequested = true }
         }
+        await quitGroup.value
 
         model.phase = .finished
         if let overlay, !overlay.isVisible {
@@ -561,6 +598,7 @@ final class OverviewController: NSObject {
         if p == .browserTabs {
             loadTabs()
         } else {
+            tabPreviewTask?.cancel()
             refreshCards(cardsNeedingRefresh)
             cardsNeedingRefresh = []
             checkAutoDismiss()
@@ -617,31 +655,118 @@ final class OverviewController: NSObject {
                 else { self.model.tabsPhase = .ready }
                 TimingLog.append("tabs groups=\(fGroups.count) tabs=\(fGroups.reduce(0) { $0 + $1.tabs.count }) ask=\(fAsk.count) denied=\(fDenied.count)")
                 self.loadFavicons(fGroups)
+                self.loadTabPreviews(fGroups)
             }
         }
     }
 
-    /// 在后台读取网站图标（只读本机图标数据库，不联网），读到一个显示一个
+    private var faviconLoadGeneration = 0
+
+    /// 后台读取本地图标。旧页面的结果不能覆盖新页面，或在总览关闭后重新填充界面。
     private func loadFavicons(_ groups: [BrowserGroup]) {
+        faviconLoadGeneration += 1
+        let iconGeneration = faviconLoadGeneration
+        let viewGeneration = loadGeneration
         var urlsByBundle: [String: [String]] = [:]
-        for g in groups {
+        for g in groups where allowedPIDs?.contains(g.pid) ?? true {
             guard let b = NSRunningApplication(processIdentifier: g.pid)?.bundleIdentifier else { continue }
             urlsByBundle[b, default: []] += g.tabs.map(\.url)
         }
+        let requests = urlsByBundle
         let store = faviconStore
         Task.detached(priority: .utility) {
             let t0 = CFAbsoluteTimeGetCurrent()
             var all: [String: NSImage] = [:]
-            for (bundle, urls) in urlsByBundle {
-                all.merge(store.load(urls: urls, bundleID: bundle)) { a, _ in a }
+            var diagnostics: [String] = []
+            var needsFolder: [String] = []
+            for (bundle, urls) in requests {
+                let icons = store.load(urls: urls, bundleID: bundle) { stats in
+                    diagnostics.append("bundle=\(bundle) \(stats.text)")
+                    if stats.requested > 0 && (stats.databases == 0 || stats.snapshotErrors > 0) { needsFolder.append(bundle) }
+                }
+                all.merge(icons) { a, _ in a }
             }
             let found = all
+            let details = diagnostics.joined(separator: "; ")
+            let inaccessible = needsFolder.first
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.model.favicons.merge(found) { _, b in b }
-                TimingLog.append("favicons found=\(found.count) ms=\(ms)")
+                guard let self, self.faviconLoadGeneration == iconGeneration, self.loadGeneration == viewGeneration else { return }
+                self.model.favicons = found
+                self.model.faviconAccessBundleID = inaccessible
+                self.model.faviconFolderMessage = inaccessible == nil ? "" : "未读到本地图标缓存，可点“授权网站图标”选择 Chrome 资料夹。"
+                TimingLog.append("favicons found=\(found.count) ms=\(ms) \(details)")
             }
+        }
+    }
+
+    /// 由用户在系统面板中选择目录，使用系统发放的访问权限；不绕过系统授权。
+    private func chooseFaviconFolder(bundleID: String) {
+        guard !isBusy else { return }
+        let panel = NSOpenPanel()
+        panel.title = "授权本地网站图标"
+        panel.message = "选择 Chrome 资料夹，或正在使用的 Default / Profile 资料夹。扫把只读取 Favicons 和它的 WAL，不修改浏览器文件。"
+        panel.prompt = "读取图标"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.directoryURL = FaviconStore.defaultRoot(bundleID: bundleID)?.deletingLastPathComponent()
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
+        panel.begin { [weak self] response in
+            guard response == .OK else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                let temporaryAccess = panel.urls.map { ($0, $0.startAccessingSecurityScopedResource()) }
+                defer { for (url, started) in temporaryAccess where started { url.stopAccessingSecurityScopedResource() } }
+                let folders = panel.urls.filter { !FaviconStore.databases(in: $0).isEmpty }
+                guard folders.count == panel.urls.count, !folders.isEmpty else {
+                    self.model.faviconFolderMessage = "所选目录没有图标库，请选择 Chrome 或含有 Favicons 的资料夹。"
+                    return
+                }
+                do {
+                    try FaviconFolderAccess.shared.authorize(folders, bundleID: bundleID)
+                    self.faviconStore.invalidate()
+                    self.model.favicons = [:]
+                    self.model.faviconFolderMessage = ""
+                    if !self.isOverlayVisible {
+                        self.show(reason: "选择图标目录后返回")
+                        self.model.page = .browserTabs
+                    }
+                    self.loadTabs()
+                } catch {
+                    self.model.faviconFolderMessage = "未能保留这个目录的访问授权，请重新选择。"
+                }
+            }
+        }
+    }
+
+    let tabPreviewCache = TabPreviewCache()
+    private var tabPreviewTask: Task<Void, Never>?
+
+    private func loadTabPreviews(_ groups: [BrowserGroup]) {
+        tabPreviewTask?.cancel()
+        guard model.screenRecording else { model.tabPreviews = [:]; return }
+        let generation = loadGeneration
+        let groups = groups.filter { allowedPIDs?.contains($0.pid) ?? true }
+        let cache = tabPreviewCache
+        let backend = tabsBackend
+        model.tabPreviews = TabPreviewLoader.cached(groups: groups, cache: cache)
+        tabPreviewTask = Task { [weak self] in
+            var count = 0
+            await TabPreviewLoader.load(groups: groups, tabs: backend, cache: cache) { key, preview in
+                guard let self, !Task.isCancelled, self.loadGeneration == generation,
+                      self.model.tab(key)?.url == preview.url, !self.model.vanishedTabs.contains(key) else { return }
+                self.model.tabPreviews = TabPreviewLoader.cached(groups: self.model.browserGroups, cache: cache)
+                // 新标签成为当前页时更新“当前”标记，不移动卡片的位置。
+                if let i = self.model.browserGroups.firstIndex(where: { $0.pid == key.pid && $0.windowID == key.windowID }) {
+                    for j in self.model.browserGroups[i].tabs.indices {
+                        self.model.browserGroups[i].tabs[j].isActive = self.model.browserGroups[i].tabs[j].id == key.tabID
+                    }
+                }
+                count += 1
+            }
+            guard !Task.isCancelled else { return }
+            TimingLog.append("tab-previews captured=\(count) cacheBytes=\(cache.byteCount)")
         }
     }
 
@@ -761,7 +886,7 @@ final class OverviewController: NSObject {
         guard !live.isEmpty, model.screenRecording else { return }
         let maxPx = thumbnailPixelSize(count: model.entries.count)
         Task { [weak self] in
-            _ = try? await ThumbnailLoader.load(ids: Array(live), maxPixelSize: maxPx) { id, image in
+            _ = try? await ThumbnailLoader.load(ids: Array(live), maxPixelSize: maxPx, includeOffscreen: self?.model.windowScope == .allDesktops) { id, image in
                 if let image { self?.model.thumbnails[id] = image }
             }
         }
@@ -772,12 +897,18 @@ final class OverviewController: NSObject {
         executor.allowedPIDs = allowedPIDs
         let exec = executor
         model.statuses[e.id] = .working
+        model.closeFeedback.begin(.window(e.id))
         let target = e.target
         let t0 = CACurrentMediaTime()
         let outcome = await Task.detached(priority: .userInitiated) { exec.attempt(target) }.value
+        model.closeFeedback.finish(.window(e.id), status: outcome.status)
+        if case .closed = model.appStatuses[e.pid], model.statuses[e.id]?.isFinal == true {
+            // 同时在退出的应用已经带走了这个窗口：保留“随应用退出而关闭”的结果
+            return .proceed
+        }
         model.statuses[e.id] = outcome.status
         model.refreshAppWindowCounts()
-        ActionLog.append(app: e.appName, status: outcome.status, note: "耗时 \(Int((CACurrentMediaTime() - t0) * 1000))ms")
+        ActionLog.append(app: e.appName, status: outcome.status, note: "耗时 \(Int((CACurrentMediaTime() - t0) * 1000))ms；\(exec.lastTiming.text)")
         guard case .needsUser(let ctx) = outcome else { return .proceed }
         let title = e.title.isEmpty ? "无标题" : e.title
         let decision = await pause(
@@ -800,20 +931,23 @@ final class OverviewController: NSObject {
 
     /// 退出一个应用（等同 ⌘Q）：应用可以询问是否保存或拒绝；绝不强制退出。
     private func processApp(_ a: AppEntry) async -> PauseDecision {
-        if NSRunningApplication(processIdentifier: a.id) == nil {
+        if !backend.isAppRunning(a.id) {
             model.appStatuses[a.id] = .closed("应用已经退出了")
             appDidQuit(a)
             return .proceed
         }
-        quitExecutor.allowedPIDs = allowedPIDs
-        let exec = quitExecutor
+        // 每次退出用独立的执行器：几个应用并行退出时，各自的计时互不干扰
+        let exec = QuitExecutor(backend: backend)
+        exec.allowedPIDs = allowedPIDs
         model.appStatuses[a.id] = .working
+        model.closeFeedback.begin(.app(a.id))
         let target = a.target
         let t0 = CACurrentMediaTime()
         let outcome = await Task.detached(priority: .userInitiated) { exec.attempt(target) }.value
+        model.closeFeedback.finish(.app(a.id), status: outcome.status)
         model.appStatuses[a.id] = outcome.status
         if case .quit = outcome { appDidQuit(a) }
-        ActionLog.append(app: a.name, status: outcome.status, note: "退出应用 耗时 \(Int((CACurrentMediaTime() - t0) * 1000))ms")
+        ActionLog.append(app: a.name, status: outcome.status, note: "退出应用 耗时 \(Int((CACurrentMediaTime() - t0) * 1000))ms；\(exec.lastTiming.text)")
         guard case .needsUser(let ctx) = outcome else { return .proceed }
         let decision = await pause(
             pid: a.id, isApp: true,
@@ -860,7 +994,7 @@ final class OverviewController: NSObject {
                             self.model.statuses[e.id] = .closed(st.category == "等待你处理" ? ClosedNote.afterUserChoice.text : ClosedNote.late.text)
                         }
                     case .closed(let d):
-                        if !d.contains("自行退出"), !d.contains("退出而关闭"), NSRunningApplication(processIdentifier: e.pid) == nil {
+                        if !d.contains("自行退出"), !d.contains("退出而关闭"), !self.backend.isAppRunning(e.pid) {
                             self.model.statuses[e.id] = .closed(d + "；随后“\(e.appName)”自行退出了（这是该应用关闭最后一个窗口时的默认行为）")
                             // 应用栏里的图标也随之淡出
                             if self.model.app(e.pid) != nil, self.model.appStatuses[e.pid] == nil {
@@ -874,7 +1008,7 @@ final class OverviewController: NSObject {
                     guard let st = self.model.appStatuses[a.id] else { continue }
                     switch st {
                     case .failed, .waitingUser:
-                        if NSRunningApplication(processIdentifier: a.id) == nil {
+                        if !self.backend.isAppRunning(a.id) {
                             self.model.appStatuses[a.id] = .closed("应用稍后已退出")
                             self.appDidQuit(a)
                         }
@@ -892,11 +1026,16 @@ final class OverviewController: NSObject {
     private var lastActionKind: ActionKind = .window
     private var clickQueue: [QueueItem] = []
     private var workerRunning = false
+    /// 正在退出的应用数：退出应用单独一条通道，彼此并行，也不挡关窗口
+    private var quitsRunning = 0
+    private var laneBusy: Bool { workerRunning || quitsRunning > 0 }
+    /// 确认框暂停一次只处理一个：几个应用同时弹出提示时依次交给你
+    private var pauseBusy = false
+    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
     private var dismissWhenIdle = false
     private var processedInSession: [WindowEntry] = []
-    lazy var quitExecutor = QuitExecutor(backend: backend)
 
-    var isWorking: Bool { workerRunning }
+    var isWorking: Bool { laneBusy }
 
     /// 用户单击了一张窗口卡片
     func cardClicked(_ e: WindowEntry) {
@@ -934,10 +1073,19 @@ final class OverviewController: NSObject {
         enqueue(.app(a.id))
     }
 
+    private func updateActiveCount() {
+        model.activeCount = clickQueue.count + (workerRunning ? 1 : 0) + quitsRunning
+    }
+
     private func enqueue(_ item: QueueItem) {
+        if case .app(let pid) = item {
+            // 退出应用：立即发出请求并单独观察，不排在关窗口后面，也不让后面的操作等它收尾
+            startQuit(pid)
+            return
+        }
         setStatus(item, .queued)
         clickQueue.append(item)
-        model.activeCount = clickQueue.count + (workerRunning ? 1 : 0)
+        updateActiveCount()
         guard !workerRunning else { return }
         workerRunning = true
         Task { await runClickWorker() }
@@ -948,22 +1096,32 @@ final class OverviewController: NSObject {
         guard status(item) == .queued, let i = clickQueue.firstIndex(of: item) else { return }
         clickQueue.remove(at: i)
         setStatus(item, nil)
-        model.activeCount = clickQueue.count + (workerRunning ? 1 : 0)
+        updateActiveCount()
     }
 
     private var compactionTask: Task<Void, Never>?
     private var lastPointerAction = CACurrentMediaTime()
+    /// 补位动画进行中到这个时刻为止：期间卡片还在移动，单击可能落到“正移过来”的卡片上，暂不响应
+    private var reflowUntil: CFTimeInterval = 0
+    var isReflowing: Bool { CACurrentMediaTime() < reflowUntil }
 
-    /// 已关闭的卡片/已退出的应用先在原位淡出；等你停手约 1 秒（没有新的点击、没在圈选、鼠标没按着）再让其余补位
+    /// 停手多久后开始补位（没有新的点击、没在圈选、鼠标没按着）
+    static let reflowIdle: CFTimeInterval = 0.45
+    /// 卡片淡出所需时间：淡出完成后才补位
+    static let vanishFade: CFTimeInterval = 0.2
+
+    /// 已关闭的卡片/已退出的应用先在原位淡出；淡出完成、且你停手约 0.45 秒后，其余平滑补位
     func scheduleCompaction() {
         compactionTask?.cancel()
+        let vanishedAt = CACurrentMediaTime()
         compactionTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 300_000_000)
+                try? await Task.sleep(nanoseconds: 40_000_000)
                 guard let self, !Task.isCancelled else { return }
-                let idle = CACurrentMediaTime() - self.lastPointerAction > 1.0
+                let now = CACurrentMediaTime()
+                let idle = now - self.lastPointerAction >= Self.reflowIdle && now - vanishedAt >= Self.vanishFade
                 if idle && !self.model.marqueeActive && NSEvent.pressedMouseButtons == 0 && self.model.phase != .paused {
-                    self.model.compactVanished()
+                    if self.model.compactVanished() { self.reflowUntil = CACurrentMediaTime() + OverviewModel.reflowDuration }
                     return
                 }
             }
@@ -1020,7 +1178,7 @@ final class OverviewController: NSObject {
     private func runClickWorker() async {
         while !clickQueue.isEmpty {
             let item = clickQueue.removeFirst()
-            model.activeCount = clickQueue.count + 1
+            updateActiveCount()
             model.remainingCount = clickQueue.count
             let decision = await process(item)
             if decision == .stop {
@@ -1029,10 +1187,31 @@ final class OverviewController: NSObject {
             }
         }
         workerRunning = false
+        laneDidFinish()
+    }
+
+    /// 单击即关闭模式：开始退出一个应用（并行通道）
+    private func startQuit(_ pid: pid_t) {
+        setStatus(.app(pid), .working)
+        quitsRunning += 1
+        updateActiveCount()
+        Task { [weak self] in
+            guard let self else { return }
+            _ = await self.process(.app(pid))
+            self.quitsRunning -= 1
+            self.laneDidFinish()
+        }
+    }
+
+    /// 某条通道处理完：两条通道都空闲后，做收尾（复查、自动退出总览等）
+    private func laneDidFinish() {
+        updateActiveCount()
+        guard !laneBusy else { return }
         model.activeCount = 0
         scheduleRecheck(processedInSession)
         checkAutoDismiss()
         processedInSession = []
+        if model.page == .browserTabs && !dismissWhenIdle { loadTabPreviews(model.browserGroups) }
         if dismissWhenIdle {
             dismissWhenIdle = false
             dismiss(hideApp: true, animated: true)
@@ -1042,6 +1221,28 @@ final class OverviewController: NSObject {
     /// 出现需要用户处理的确认框：暂停队列，把原应用带到前面，显示小面板，等用户决定。
     private func pause(pid: pid_t, isApp: Bool, message: String, raise: (() -> Void)?,
                        check: @escaping () -> PendingState, apply: @escaping (PendingState) -> Void) async -> PauseDecision {
+        // 一次只暂停一个；轮到时若你已直接在原应用里处理完，就不再打扰
+        let waited = pauseBusy
+        if waited {
+            await withCheckedContinuation { pauseWaiters.append($0) }
+        }
+        pauseBusy = true
+        defer {
+            if pauseWaiters.isEmpty { pauseBusy = false } else { pauseWaiters.removeFirst().resume() }
+        }
+        if waited {
+            var before = await Task.detached { check() }.value
+            // “取消”同样需连续两次确认，避免对话框切换瞬间误判
+            if before == .keptOpen {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                before = await Task.detached { check() }.value
+            }
+            if before != .stillWaiting {
+                model.pendingState = before
+                apply(before)
+                return .proceed
+            }
+        }
         let previousPhase = model.phase
         model.phase = .paused
         model.pauseMessage = message

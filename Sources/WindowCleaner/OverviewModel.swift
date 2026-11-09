@@ -109,6 +109,9 @@ final class OverviewModel: ObservableObject {
     @Published var cardsRevealed = true
     /// 系统设置里开了“减弱动态效果”时只做淡入淡出
     var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+    @Published var windowScope: WindowScope = WindowScope(rawValue: UserDefaults.standard.string(forKey: "windowScope") ?? "") ?? .allDesktops {
+        didSet { UserDefaults.standard.set(windowScope.rawValue, forKey: "windowScope") }
+    }
     @Published var entries: [WindowEntry] = []
     @Published var apps: [AppEntry] = []
     /// 按选中的先后顺序排列，也是执行顺序（先选再关模式）
@@ -167,12 +170,15 @@ final class OverviewModel: ObservableObject {
         }
     }
     @Published var vanishedTabs: Set<TabKey> = []
-    /// 网站图标，按主机名（来自浏览器本机的图标数据库）
+    /// 网站图标按“浏览器 + 页面网址”区分，同一网站的不同页面也可有不同图标。
     @Published var favicons: [String: NSImage] = [:]
+    @Published var tabPreviews: [TabKey: TabPreview] = [:]
+    @Published var faviconAccessBundleID: String?
+    @Published var faviconFolderMessage = ""
 
-    func favicon(for url: String) -> NSImage? {
-        guard let host = URL(string: url)?.host?.lowercased() else { return nil }
-        return favicons[host]
+    func favicon(for url: String, bundleID: String) -> NSImage? {
+        guard let key = FaviconStore.cacheKey(url: url, bundleID: bundleID) else { return nil }
+        return favicons[key]
     }
     @Published var hoveredTab: TabKey?
     @Published var tabMarqueeKeys: Set<TabKey> = []
@@ -279,6 +285,9 @@ final class OverviewModel: ObservableObject {
     /// 单击即关闭模式下，正在排队或正在处理的数量
     @Published var activeCount = 0
 
+    // 关闭动效只使用独立合成层，不逐帧发布整个界面的状态。
+    let closeFeedback = CloseFeedbackCoordinator()
+
     // 圈选
     let marquee = MarqueeState()
     @Published var marqueeIDs: Set<CGWindowID> = []
@@ -311,6 +320,7 @@ final class OverviewModel: ObservableObject {
     private var iconCache: [pid_t: NSImage] = [:]
 
     func reset() {
+        closeFeedback.reset()
         entries = []
         apps = []
         cardsRevealed = false
@@ -331,6 +341,7 @@ final class OverviewModel: ObservableObject {
         cardFrames = [:]
         appFrames = [:]
         tabStatuses = [:]
+        tabPreviews = [:]
         vanishedTabs = []
         tabMarqueeKeys = []
         appMarqueeIDs = []
@@ -396,12 +407,17 @@ final class OverviewModel: ObservableObject {
     var closableCount: Int { entries.filter(\.isClosable).count }
 
     /// 把已淡出的卡片和应用图标移除，其余平滑补位
-    func compactVanished() {
+    /// 补位动画约多长（用于补位途中暂不响应单击）
+    static let reflowDuration: CFTimeInterval = 0.3
+
+    @discardableResult
+    func compactVanished() -> Bool {
         let hasCards = entries.contains { vanished.contains($0.id) }
         let hasApps = apps.contains { vanishedApps.contains($0.id) }
         let hasTabs = browserGroups.contains { g in g.tabs.contains { vanishedTabs.contains(g.key($0)) } }
-        guard hasCards || hasApps || hasTabs else { return }
-        withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+        guard hasCards || hasApps || hasTabs else { return false }
+        // 利落、几乎不回弹的弹簧：约 0.3 秒到位
+        withAnimation(reduceMotion ? .easeOut(duration: 0.2) : .spring(response: 0.3, dampingFraction: 0.92)) {
             entries.removeAll { vanished.contains($0.id) }
             apps.removeAll { vanishedApps.contains($0.id) }
             for i in browserGroups.indices {
@@ -417,6 +433,7 @@ final class OverviewModel: ObservableObject {
                 }
             }
         }
+        return true
     }
 
     /// 窗口卡片数变化后，更新应用栏里的窗口数

@@ -27,9 +27,9 @@ public enum WindowMatcher {
     ///   - peers: 同一进程当前在屏幕上的其他窗口（任意层级）
     ///   - axWindows: 同一进程在辅助功能里列出的全部窗口
     public static func match(target: CGWindowInfo, peers: [CGWindowInfo], axWindows: [AXWindowInfo]) -> Verdict {
-        // 目标在屏幕上，所以它对应的辅助功能窗口一定不是最小化的。
+        // 屏幕上的目标不可能是最小化窗口；其他桌面的目标需要保留所有候选，再用唯一性判断。
         let candidates = axWindows.enumerated().filter { _, ax in
-            guard !ax.isMinimized, let f = ax.frame else { return false }
+            guard !(target.isOnScreen && ax.isMinimized), let f = ax.frame else { return false }
             return framesMatch(f, target.bounds)
         }
         if candidates.isEmpty { return .notFound }
@@ -57,7 +57,7 @@ public enum WindowMatcher {
     }
 
     /// 是否像一个对话框/表单窗口（用于判断关闭后是否弹出了确认框）。
-    public static func isDialogCandidate(_ w: CGWindowInfo) -> Bool {
-        w.isOnScreen && w.alpha > 0.01 && (0...20).contains(w.layer) && w.bounds.width >= 60 && w.bounds.height >= 40
+    public static func isDialogCandidate(_ w: CGWindowInfo, includeOffscreen: Bool = false) -> Bool {
+        (w.isOnScreen || includeOffscreen) && w.alpha > 0.01 && (0...20).contains(w.layer) && w.bounds.width >= 60 && w.bounds.height >= 40
     }
 }

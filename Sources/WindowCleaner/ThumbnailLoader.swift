@@ -10,11 +10,11 @@ enum ThumbnailLoader {
 
     /// 逐个回调结果；返回成功数和失败数。
     @MainActor
-    static func load(ids: [CGWindowID], maxPixelSize: CGSize,
+    static func load(ids: [CGWindowID], maxPixelSize: CGSize, includeOffscreen: Bool = false,
                      onImage: @escaping @MainActor (CGWindowID, NSImage?) -> Void) async throws -> (ok: Int, failed: Int) {
         let content: SCShareableContent
         do {
-            content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+            content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: !includeOffscreen)
         } catch {
             throw LoadError.contentUnavailable(error.localizedDescription)
         }

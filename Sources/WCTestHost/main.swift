@@ -1,4 +1,4 @@
-// WC 测试宿主：只用于“窗口清理”的自检。
+// WC 测试宿主：只用于“扫把”的自检。
 // 它按配置打开一批带编号、标题和底色的测试窗口，并把自己窗口的真实状态（窗口编号、是否已关闭、
 // 收到过哪些关闭请求）写进状态文件，自检程序据此核对“选中的窗口确实就是被关掉的那个”。
 //
@@ -32,6 +32,8 @@ struct HostConfig: Codable {
     var windows: [WindowSpec]
     var quitAfterLastWindow: Bool?
     var lifetimeSeconds: Double?
+    /// 收到退出请求后先“收尾” N 秒再退出（模拟飞书等退出较慢的应用）
+    var quitDelay: Double?
 }
 
 struct WindowState: Codable {
@@ -145,6 +147,13 @@ final class Host: NSObject, NSApplicationDelegate, NSWindowDelegate {
         log("ready")
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let delay = config.quitDelay, delay > 0 else { return .terminateNow }
+        log("quitDelay")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { sender.reply(toApplicationShouldTerminate: true) }
+        return .terminateLater
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         config.quitAfterLastWindow ?? false
     }
@@ -247,13 +256,70 @@ final class Host: NSObject, NSApplicationDelegate, NSWindowDelegate {
         log("sheetShown", l)
         guard let resp = s.autoResponse else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + (s.autoResponseDelay ?? 1.5)) { [weak self] in
-            guard let sheet = w.attachedSheet, let button = Self.findButton(in: sheet.contentView, response: resp) else {
-                self?.log("autoResponseFailed:\(resp)", l)
+            guard let sheet = w.attachedSheet else {
+                self?.log("autoResponseFailed:\(resp) sheet=false", l)
                 return
             }
-            self?.log("autoResponse:\(resp)", l)
+            self?.respond(to: w, sheet: sheet, resp: resp, label: l)
+        }
+    }
+
+    func respond(to w: NSWindow, sheet: NSWindow, resp: String, label l: String) {
+        do { // 先找普通按钮；新版系统的提示框改用辅助功能按钮或结束表单
+            guard let button = Self.findButton(in: sheet.contentView, response: resp) else {
+                // 新版系统的提示框按钮可能不是 NSButton 视图：改从本应用自己的辅助功能树里找按钮按下
+                let followUp = {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
+                        self.log(w.attachedSheet == nil ? "sheetGone" : "sheetStillOpen", l)
+                    }
+                }
+                if let element = Self.findAXButton(in: sheet, response: resp, depth: 0), element.accessibilityPerformPress() {
+                    self.log("autoResponse:\(resp)", l)
+                    self.log("via:ax", l)
+                    followUp()
+                    return
+                }
+                // 新版系统的保存提示按钮不在本进程视图树里：由测试应用结束自己的表单，
+                // 返回值与用户点按钮相同（存储=第一个，取消=第二个，不存储=第三个）
+                w.endSheet(sheet, returnCode: resp == "cancel" ? .alertSecondButtonReturn : .alertThirdButtonReturn)
+                self.log("autoResponse:\(resp)", l)
+                self.log("via:endSheet", l)
+                followUp()
+                return
+            }
+            self.log("autoResponse:\(resp)", l)
             button.performClick(nil)
         }
+    }
+
+    static func findAXButton(in element: Any, response: String, depth: Int) -> NSAccessibilityProtocol? {
+        guard depth < 12, let e = element as? NSAccessibilityProtocol else { return nil }
+        let roleFn: (() -> NSAccessibility.Role?)? = e.accessibilityRole
+        let role = roleFn?() ?? nil
+        if role == .button {
+            let titleFn: (() -> String?)? = e.accessibilityTitle
+            let labelFn: (() -> String?)? = e.accessibilityLabel
+            let title = titleFn?() ?? nil
+            let label = labelFn?() ?? nil
+            let t = ((title ?? "") + " " + (label ?? "")).lowercased()
+            let hit = response == "cancel" ? (t.contains("cancel") || t.contains("取消"))
+                : (t.contains("don") || t.contains("不存储") || t.contains("不保存") || t.contains("delete") || t.contains("删除"))
+            if hit { return e }
+        }
+        let childrenFn: (() -> [Any]?)? = e.accessibilityChildren
+        let children = childrenFn?() ?? nil
+        for child in children ?? [] {
+            if let found = findAXButton(in: child, response: response, depth: depth + 1) { return found }
+        }
+        return nil
+    }
+
+    static func buttonTitles(in view: NSView?) -> [String] {
+        guard let view else { return [] }
+        var out: [String] = []
+        if let b = view as? NSButton { out.append("\(b.title)[\(b.keyEquivalent == "\u{1b}" ? "esc" : b.keyEquivalent)]") }
+        for sub in view.subviews { out += buttonTitles(in: sub) }
+        return out
     }
 
     static func findButton(in view: NSView?, response: String) -> NSButton? {

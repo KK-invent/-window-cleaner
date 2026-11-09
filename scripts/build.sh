@@ -1,7 +1,7 @@
 #!/bin/bash
-# 构建“窗口清理”及其测试工具。只需要 Xcode 命令行工具（swiftc），不需要完整 Xcode。
+# 构建“扫把”及其测试工具。只需要 Xcode 命令行工具（swiftc），不需要完整 Xcode。
 #
-#   scripts/build.sh            # 构建全部：dist/窗口清理.app、dist/测试工具/*.app、build/CoreChecks
+#   scripts/build.sh            # 构建全部：dist/扫把.app、dist/测试工具/*.app、build/CoreChecks
 #   scripts/build.sh app        # 只构建主应用
 #   scripts/build.sh testhost   # 只构建测试宿主
 #   scripts/build.sh checks     # 只构建并运行逻辑检查
@@ -114,12 +114,13 @@ build_testhost() {
 }
 
 build_icon() {
-  if [ ! -f "$BUILD/AppIcon.icns" ] || [ scripts/make_icon.swift -nt "$BUILD/AppIcon.icns" ]; then
+  if [ ! -f "$BUILD/SaobaIcon.icns" ] || [ ! -f "$ROOT/Assets/SaobaIcon.png" ] || [ scripts/make_icon.swift -nt "$BUILD/SaobaIcon.icns" ]; then
     echo "▶ 生成图标"
     swiftc "${FLAGS[@]}" -o "$BUILD/make_icon" scripts/make_icon.swift
-    rm -rf "$BUILD/AppIcon.iconset"
-    "$BUILD/make_icon" "$BUILD/AppIcon.iconset"
-    iconutil -c icns "$BUILD/AppIcon.iconset" -o "$BUILD/AppIcon.icns"
+    rm -rf "$BUILD/SaobaIcon.iconset"
+    mkdir -p "$ROOT/Assets"
+    "$BUILD/make_icon" "$BUILD/SaobaIcon.iconset" "$ROOT/Assets/SaobaIcon.png"
+    iconutil -c icns "$BUILD/SaobaIcon.iconset" -o "$BUILD/SaobaIcon.icns"
   fi
 }
 
@@ -129,14 +130,14 @@ build_app() {
   swiftc "${FLAGS[@]}" -parse-as-library -o "$BUILD/WindowCleaner" \
     Sources/WindowCleanerCore/*.swift Sources/WindowCleaner/*.swift
   # 先在临时目录组装（目录名带 .noindex，聚焦搜索不会收录），签名后安装到“应用程序”
-  local app="$BUILD/staging.noindex/窗口清理.app"
+  local app="$BUILD/staging.noindex/扫把.app"
   rm -rf "$app"
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/zh-Hans.lproj"
   cp "$BUILD/WindowCleaner" "$app/Contents/MacOS/WindowCleaner"
-  cp "$BUILD/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
-  echo '"CFBundleDisplayName" = "窗口清理";' > "$app/Contents/Resources/zh-Hans.lproj/InfoPlist.strings"
-  write_plist "$app/Contents/Info.plist" "窗口清理" "WindowCleaner" "local.windowcleaner.app" "zh_CN" \
-    "<key>CFBundleIconFile</key><string>AppIcon</string>
+  cp "$BUILD/SaobaIcon.icns" "$app/Contents/Resources/SaobaIcon.icns"
+  echo '"CFBundleDisplayName" = "扫把";' > "$app/Contents/Resources/zh-Hans.lproj/InfoPlist.strings"
+  write_plist "$app/Contents/Info.plist" "扫把" "WindowCleaner" "local.windowcleaner.app" "zh_CN" \
+    "<key>CFBundleIconFile</key><string>SaobaIcon</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>CFBundleLocalizations</key><array><string>zh-Hans</string></array>
   <key>NSHumanReadableCopyright</key><string>本地自用工具，不联网</string>
@@ -151,16 +152,33 @@ build_app() {
 install_app() {
   local app="$1"
   local dir="${INSTALL_DIR:-/Applications}"
-  local dest="$dir/窗口清理.app"
+  local dest="$dir/扫把.app"
   if [ -w "$dir" ]; then
-    rm -rf "$dest"
-    ditto "$app" "$dest"
-    rm -rf "$app" "$DIST/窗口清理.app"
-    codesign --verify --strict "$dest" && echo "  → 已安装到 $dest"
+    local legacy="$dir/窗口清理.app"
+    local expected="local.windowcleaner.app"
+    # 只迁移本项目的旧应用；保留外层目录身份，让已有 Dock 书签跟随改名。
+    if [ ! -e "$dest" ] && [ -d "$legacy" ]; then
+      local legacy_id; legacy_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$legacy/Contents/Info.plist" 2>/dev/null || true)"
+      if [ "$legacy_id" = "$expected" ]; then mv "$legacy" "$dest"; fi
+    fi
+    if [ -e "$dest" ]; then
+      local dest_id; dest_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$dest/Contents/Info.plist" 2>/dev/null || true)"
+      if [ "$dest_id" != "$expected" ]; then
+        echo "  ⚠ $dest 是另一个应用，停止安装，不覆盖它。"
+        return 1
+      fi
+    fi
+    codesign --verify --strict "$app"
+    mkdir -p "$dest"
+    rm -rf "$dest/Contents"
+    ditto "$app/Contents" "$dest/Contents"
+    codesign --verify --strict "$dest"
+    rm -rf "$app" "$DIST/扫把.app"
+    echo "  → 已安装到 $dest"
   else
-    rm -rf "$DIST/窗口清理.app"
-    mv "$app" "$DIST/窗口清理.app"
-    echo "  ⚠ 没有写入 $dir 的权限，应用保留在 $DIST/窗口清理.app"
+    rm -rf "$DIST/扫把.app"
+    mv "$app" "$DIST/扫把.app"
+    echo "  ⚠ 没有写入 $dir 的权限，应用保留在 $DIST/扫把.app"
   fi
 }
 

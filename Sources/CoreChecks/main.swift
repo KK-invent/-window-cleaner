@@ -42,8 +42,11 @@ final class MockBackend: WindowBackend {
     }
 
     func onScreenWindows() -> [CGWindowInfo] { windows.values.filter(\.isOnScreen).sorted { $0.windowID < $1.windowID } }
+    func allWindows() -> [CGWindowInfo] { windows.values.sorted { $0.windowID < $1.windowID } }
     func windowInfo(_ id: CGWindowID) -> CGWindowInfo? { windows[id] }
     func isAppRunning(_ pid: pid_t) -> Bool { running.contains(pid) }
+    var hiddenPIDs: Set<pid_t> = []
+    func isAppHidden(_ pid: pid_t) -> Bool { hiddenPIDs.contains(pid) }
 
     var quitRequests: [pid_t] = []
     /// 收到退出请求时发生什么；默认：应用立即退出
@@ -56,7 +59,19 @@ final class MockBackend: WindowBackend {
         return true
     }
 
+    var dialogReads = 0
+    var fullAXReads = 0
+    var onDialogRead: ((pid_t, Float) -> Result<Bool, AXAccessError>)?
+    func appHasDialog(pid: pid_t, timeout: Float) -> Result<Bool, AXAccessError> {
+        dialogReads += 1
+        if let onDialogRead { return onDialogRead(pid, timeout) }
+        if !trusted { return .failure(.notTrusted) }
+        if unresponsive.contains(pid) { return .failure(.appUnresponsive) }
+        return .success((ax[pid] ?? []).contains { $0.info.hasSheet })
+    }
+
     func axWindows(pid: pid_t, timeout: Float, includeSheetCheck: Bool) -> Result<[AXWindowRef], AXAccessError> {
+        fullAXReads += 1
         if !trusted { return .failure(.notTrusted) }
         if unresponsive.contains(pid) { return .failure(.appUnresponsive) }
         return .success((ax[pid] ?? []).map { AXWindowRef(info: $0.info, handle: $0) })
@@ -73,6 +88,12 @@ final class MockBackend: WindowBackend {
     func refreshAXInfo(_ ref: AXWindowRef, timeout: Float) -> AXWindowInfo? {
         let w = ref.handle as! MockAXWindow
         return w.alive ? w.info : nil
+    }
+
+    var goneChecks = 0
+    func axWindowIsGone(_ ref: AXWindowRef, timeout: Float) -> Bool {
+        goneChecks += 1
+        return !(ref.handle as! MockAXWindow).alive
     }
 
     func sleep(_ seconds: Double) {
@@ -299,6 +320,58 @@ enum CoreChecks {
             if case .closed = o { check("请求超时但窗口随后消失 → 已关闭（以观察结果为准）", true) } else { check("超时后关闭", false, outcomeName(o)) }
         }
 
+        print("关窗淡出期间提前确认")
+        do {
+            // 模拟系统关窗动画：应用立刻销毁窗口对象，窗口记录淡出 0.3 秒后才被系统删除
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "淡出", frame: r(0, 0))
+            b.add(2, pid: 10, title: "其他", frame: r(500, 0))
+            b.onPress = { w in
+                w.alive = false
+                b.windows[1]!.alpha = 0.6
+                b.timeline.append((b.clock + 0.3, { b.remove(1) }))
+                return .success
+            }
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "淡出"))
+            if case .closed(.destroyed) = o {
+                check("淡出已开始且应用报告窗口不存在 → 立即确认关闭，不等 0.3 秒动画", b.clock < 0.05, "clock=\(b.clock)")
+            } else { check("淡出提前确认", false, outcomeName(o)) }
+            check("提前确认时只按了目标窗口", b.pressed == [1] && b.windows[2] != nil)
+        }
+        do {
+            // 应用自己把窗口变透明，但窗口对象仍然有效 → 不能提前判定
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "半透明", frame: r(0, 0))
+            b.onPress = { _ in b.windows[1]!.alpha = 0.5; return .success }
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "半透明"))
+            if case .failed(.stillOpen) = o { check("窗口变透明但应用仍有这个窗口 → 不提前判定（关闭失败）", true) } else { check("透明但仍在", false, outcomeName(o)) }
+        }
+        do {
+            // 窗口对象无效，但没有关窗淡出 → 仍等系统删除窗口记录
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "无淡出", frame: r(0, 0))
+            b.onPress = { w in
+                w.alive = false
+                b.timeline.append((b.clock + 0.3, { b.remove(1) }))
+                return .success
+            }
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "无淡出"))
+            if case .closed(.destroyed) = o { check("没有关窗淡出时不提前判定，等窗口真正消失", b.clock >= 0.3) } else { check("无淡出", false, outcomeName(o)) }
+        }
+        do {
+            // 淡出期间出现了新的确认窗口 → 暂停交给用户，不判成功
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "带确认", frame: r(0, 0))
+            b.onPress = { w in
+                w.alive = false
+                b.windows[1]!.alpha = 0.6
+                b.windows[9] = CGWindowInfo(windowID: 9, pid: 10, ownerName: "App10", title: "是否保存", bounds: r(100, 100, 260, 120))
+                return .success
+            }
+            let o = executor(b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "带确认"))
+            if case .needsUser = o { check("淡出时出现新确认窗口 → 等待你处理，不判为已关闭", true) } else { check("淡出+确认窗口", false, outcomeName(o)) }
+        }
+
         print("退出应用")
         do {
             let b = MockBackend()
@@ -360,6 +433,68 @@ enum CoreChecks {
             b.onPress = { _ in .success }
             _ = CloseExecutor(backend: b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "A1"))
             check("关闭窗口（即使关不掉）也不会退出应用", b.quitRequests.isEmpty)
+        }
+
+        print("退出应用耗时回归")
+        do {
+            let b = MockBackend()
+            b.running.insert(10)
+            b.onTerminate = { pid in
+                b.timeline.append((b.clock + 0.08, { b.running.remove(pid) }))
+                return true
+            }
+            let e = QuitExecutor(backend: b)
+            let o = e.attempt(QuitTarget(pid: 10, appName: "快速退出"))
+            if case .quit = o {
+                check("快速退出：100 毫秒内发现结束，不做辅助功能读取", b.clock <= 0.101 && b.dialogReads == 0 && b.fullAXReads == 0)
+            } else { check("快速退出", false, "\(o.status)") }
+        }
+        do {
+            let b = MockBackend()
+            b.running.insert(10)
+            b.onTerminate = { pid in
+                b.timeline.append((b.clock + 0.65, { b.running.remove(pid) }))
+                return true
+            }
+            b.onDialogRead = { _, budget in
+                b.sleep(Double(budget))
+                return .failure(.appUnresponsive)
+            }
+            let e = QuitExecutor(backend: b)
+            let o = e.attempt(QuitTarget(pid: 10, appName: "检查中退出"))
+            if case .quit = o {
+                check("弹窗检查期间进程结束：检查返回后立即认定退出，不额外等待", b.clock <= 0.771 && b.fullAXReads == 0)
+                check("日志记录弹窗检查实际开销", e.lastTiming.dialogChecks > 0 && e.lastTiming.dialogTime > 0)
+            } else { check("检查中退出", false, "\(o.status)") }
+        }
+        do {
+            let b = MockBackend()
+            b.running.insert(10)
+            b.onTerminate = { _ in true }
+            b.onDialogRead = { _, budget in
+                b.sleep(Double(budget))
+                return .failure(.appUnresponsive)
+            }
+            let e = QuitExecutor(backend: b)
+            let o = e.attempt(QuitTarget(pid: 10, appName: "无响应"))
+            if case .failed = o {
+                check("持续无响应：辅助功能超时不会叠加成多秒额外等待", b.clock <= e.timeout + 0.001 && b.fullAXReads == 0 && b.running.contains(10))
+            } else { check("持续无响应", false, "\(o.status)") }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "未保存", frame: r(0, 0))
+            b.onTerminate = { _ in b.ax[10]![0].info.hasSheet = true; return true }
+            let e = QuitExecutor(backend: b)
+            let o = e.attempt(QuitTarget(pid: 10, appName: "保存表单"))
+            if case .needsUser(let ctx) = o {
+                check("没有新增窗口的保存表单仍能识别并暂停", b.clock < 1 && b.fullAXReads == 0 && e.checkPending(ctx) == .stillWaiting)
+                b.ax[10]![0].info.hasSheet = false
+                b.unresponsive.insert(10)
+                check("暂停中读不到弹窗状态：继续等待，不假报用户取消", e.checkPending(ctx) == .stillWaiting)
+                b.unresponsive.remove(10)
+                check("用户取消保存后：应用仍在，退出请求只发一次", e.checkPending(ctx) == .keptOpen && b.running.contains(10) && b.quitRequests == [10])
+            } else { check("保存表单", false, "\(o.status)") }
         }
 
         print("浏览器标签页")
@@ -432,6 +567,101 @@ enum CoreChecks {
                   wrong.map { "\($0.0) → \(BrowserTabSupport.siteName(for: $0.0))" }.joined(separator: "；"))
         }
 
+        print("全部桌面与全屏窗口")
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "当前窗口", frame: r(0, 0))
+            b.add(2, pid: 10, title: "其他桌面窗口", frame: r(200, 100))
+            b.windows[2]!.isOnScreen = false
+            let current = WindowEnumerator.enumerate(backend: b, ownPID: getpid(), scope: .currentDesktop)
+            let all = WindowEnumerator.enumerate(backend: b, ownPID: getpid(), scope: .allDesktops)
+            check("当前桌面模式只显示当前窗口，全部桌面模式同时显示其他桌面", current.entries.map(\.id) == [1] && Set(all.entries.map(\.id)) == Set([1, 2]))
+            check("跨桌面窗口标明范围，并且关闭目标允许重新核对其他桌面", all.entries.first { $0.id == 2 }?.locationLabel != nil && all.entries.first { $0.id == 2 }?.target.allowOffscreen == true)
+            let e = CloseExecutor(backend: b)
+            let o = e.attempt(CloseTarget(windowID: 2, pid: 10, appName: "A", title: "其他桌面窗口", allowOffscreen: true))
+            if case .closed(.destroyed) = o {
+                check("唯一匹配的跨桌面窗口可关闭，同应用未选窗口保持原样", b.pressed == [2] && b.windows[1] != nil)
+            } else { check("跨桌面窗口关闭", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "其他桌面", frame: r(0, 0))
+            b.windows[1]!.isOnScreen = false
+            b.onPress = { _ in .success }
+            let o = CloseExecutor(backend: b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "其他桌面", allowOffscreen: true))
+            if case .failed(.stillOpen) = o {
+                check("本来就在其他桌面的窗口仍存在，不能凭“不在屏幕上”假报关闭", b.windows[1] != nil)
+            } else { check("跨桌面不假报成功", false, outcomeName(o)) }
+            b.pressed = []
+            let oldScope = CloseExecutor(backend: b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "其他桌面"))
+            if case .skipped(.notOnScreen) = oldScope { check("当前桌面目标移到其他桌面后仍应跳过", b.pressed.isEmpty) }
+            else { check("当前桌面范围", false, outcomeName(oldScope)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "未保存文档", frame: r(0, 0))
+            b.windows[1]!.isOnScreen = false
+            b.onPress = { w in w.info.hasSheet = true; return .success }
+            let e = CloseExecutor(backend: b)
+            let o = e.attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "未保存文档", allowOffscreen: true))
+            if case .needsUser(let ctx) = o {
+                check("其他桌面的保存表单照样暂停，不能误报窗口已关闭", !ctx.wasOnScreen && e.checkPending(ctx) == .stillWaiting)
+                b.ax[10]![0].info.hasSheet = false
+                check("其他桌面上取消保存后，文档仍在", e.checkPending(ctx) == .keptOpen && b.windows[1] != nil)
+            } else { check("其他桌面保存提示", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "全屏测试", frame: r(0, 0, 1920, 1080), noAX: true)
+            b.windows[1]!.isOnScreen = false
+            let all = WindowEnumerator.enumerate(backend: b, ownPID: getpid(), scope: .allDesktops)
+            check("仅有服务器标题但无 AX 确认的屏幕外窗口不展示", all.entries.isEmpty)
+            let o = CloseExecutor(backend: b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "全屏测试", allowOffscreen: true))
+            if case .skipped(.notUniquelyIdentified) = o { check("即使绕过界面也不能关闭无法确认的全屏窗口", b.pressed.isEmpty) }
+            else { check("全屏关闭安全复核", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "同名全屏", frame: r(0, 0, 1920, 1080))
+            b.add(2, pid: 10, title: "同名全屏", frame: r(0, 0, 1920, 1080))
+            b.windows[1]!.isOnScreen = false
+            b.windows[2]!.isOnScreen = false
+            let all = WindowEnumerator.enumerate(backend: b, ownPID: getpid(), scope: .allDesktops)
+            check("不同桌面但同名同位置的全屏窗口无法区分时全部阻止关闭", all.entries.count == 2 && all.entries.allSatisfy { !$0.isClosable })
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "最小化", frame: r(0, 0), ax: AXWindowInfo(title: "最小化", frame: r(0, 0), isMinimized: true))
+            b.windows[1]!.isOnScreen = false
+            b.add(2, pid: 10, title: "", frame: r(100, 100), noAX: true)
+            b.windows[2]!.isOnScreen = false
+            let all = WindowEnumerator.enumerate(backend: b, ownPID: getpid(), scope: .allDesktops)
+            check("最小化窗口和无 AX 的后台缓冲窗口都不展示", all.entries.isEmpty)
+            let o = CloseExecutor(backend: b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "最小化", allowOffscreen: true))
+            if case .skipped(.notOnScreen) = o { check("窗口在执行前变成最小化时不发送关闭请求", b.pressed.isEmpty) }
+            else { check("最小化执行前复核", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "已隐藏", frame: r(0, 0))
+            b.windows[1]!.isOnScreen = false
+            b.hiddenPIDs.insert(10)
+            let all = WindowEnumerator.enumerate(backend: b, ownPID: getpid(), scope: .allDesktops)
+            check("已隐藏的应用即使仍报告 AX 窗口，也不出现在总览", all.entries.isEmpty)
+            let o = CloseExecutor(backend: b).attempt(CloseTarget(windowID: 1, pid: 10, appName: "A", title: "已隐藏", allowOffscreen: true))
+            if case .skipped(.notOnScreen) = o { check("窗口在执行前被隐藏时不发送关闭请求", b.pressed.isEmpty) }
+            else { check("隐藏执行前复核", false, outcomeName(o)) }
+        }
+        do {
+            let b = MockBackend()
+            b.add(1, pid: 10, title: "已关闭但服务器还留着", frame: r(0, 0), noAX: true)
+            b.windows[1]!.isOnScreen = false
+            b.add(2, pid: 10, title: "真正的其他桌面窗口", frame: r(100, 80))
+            b.windows[2]!.isOnScreen = false
+            let all = WindowEnumerator.enumerate(backend: b, ownPID: getpid(), scope: .allDesktops)
+            check("不按标题收录后台保留记录，仍保留真正可确认的其他桌面窗口", all.entries.map(\.id) == [2])
+        }
+
         print("窗口列表")
         do {
             let b = MockBackend()
@@ -455,6 +685,8 @@ enum CoreChecks {
             check("无辅助功能权限时标记为未授权，不可选", !res2.axTrusted && res2.entries.allSatisfy { !$0.isClosable })
         }
 
+        runFaviconChecks()
+        runTabPreviewChecks()
         print("\n结果：通过 \(passed) 项，未通过 \(failed) 项")
         exit(failed == 0 ? 0 : 1)
     }

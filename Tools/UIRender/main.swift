@@ -45,6 +45,7 @@ enum UIRender {
     @MainActor static func main() {
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.accessory)
+        if let icon = NSImage(contentsOfFile: "Assets/SaobaIcon.png") { NSApp.applicationIconImage = icon }
         let out = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "."
         let apps: [(String, String?)] = [("Google Chrome", "com.google.Chrome"), ("文本编辑", nil), ("访达", nil), ("备忘录", nil), ("预览", nil), ("Safari浏览器", "com.apple.Safari")]
         let titles = ["产品需求文档 v3 — 最终版（请勿外传）", "未命名", "下载", "2026 年度预算.numbers", "GitHub - apple/swift: The Swift Programming Language — 一个非常长的标题用来测试截断效果", "设计稿评审记录", "WC测试-文档1", "会议纪要 11-06", "照片 IMG_2048.HEIC", ""]
@@ -125,7 +126,15 @@ enum UIRender {
         func tabs(_ n: Int, _ off: Int) -> [BrowserTab] { (0..<n).map { i in let s = sites[(i + off) % sites.count]; return BrowserTab(id: "\(off)-\(i)", title: s.0, url: s.1, isActive: i == 0) } }
         m11.browserGroups = [BrowserGroup(pid: 1, appName: "Google Chrome", windowID: "w1", title: "GitHub - apple/swift: The Swift Programming Language", cardID: 1000, tabs: tabs(13, 0)),
                              BrowserGroup(pid: 1, appName: "Google Chrome", windowID: "w2", title: "Gmail - 收件箱 (12)", cardID: 1006, tabs: tabs(8, 9))]
+        // 仅演示布局的合成预览；不读取或截取真实浏览器内容。
         let g0 = m11.browserGroups[0]
+        for group in m11.browserGroups {
+            for (index, tab) in group.tabs.enumerated() where index == 0 || index == 3 {
+                let key = group.key(tab)
+                m11.tabPreviews[key] = TabPreview(key: key, url: tab.url,
+                    image: fakeThumb(240, 150, hue: CGFloat(index) / 6, title: "界面演示"), capturedAt: Date())
+            }
+        }
         m11.tabStatuses[g0.key(g0.tabs[1])] = .closed("")
         m11.tabStatuses[g0.key(g0.tabs[2])] = .working
         m11.tabMarqueeKeys = [g0.key(g0.tabs[5]), g0.key(g0.tabs[6])]

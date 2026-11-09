@@ -1,10 +1,8 @@
 import Foundation
 import CoreGraphics
 
-// 退出应用：等同于对该应用按 ⌘Q（向它发送标准的“退出”请求）。
-// 应用可以弹出“是否保存”等确认框，也可以拒绝退出；这里只观察结果，绝不强制退出、不替用户点任何按钮。
-// 这是与“关闭窗口”分开的独立功能：关闭窗口的流程里仍然不会退出任何应用。
-
+// 正常退出（等同 ⌘Q），不强制退出、不处理原应用的保存选项。
+// 关闭窗口与退出应用仍是两条独立的操作路径。
 public struct QuitTarget: Equatable, Sendable {
     public var pid: pid_t
     public var appName: String
@@ -17,7 +15,7 @@ public struct QuitTarget: Equatable, Sendable {
 
 public struct QuitPendingContext {
     public var target: QuitTarget
-    /// 发出退出请求前该应用已在屏幕上的窗口；之后多出来的就是确认框
+    /// 发送请求前已有的窗口；之后新增的窗口可能是确认框。
     public var baseline: Set<CGWindowID>
 
     public init(target: QuitTarget, baseline: Set<CGWindowID>) {
@@ -42,63 +40,115 @@ public enum QuitOutcome {
     }
 }
 
+/// 将请求时间、观察时间和弹窗检查开销分开记录，避免把程序自身的等待算到目标应用头上。
+public struct QuitTiming {
+    public var prepare: Double = 0
+    public var request: Double = 0
+    public var observe: Double = 0
+    public var dialogChecks: Int = 0
+    public var dialogTime: Double = 0
+
+    public var text: String {
+        "准备 \(Int(prepare * 1000))ms 请求 \(Int(request * 1000))ms 观察 \(Int(observe * 1000))ms 弹窗检查 \(dialogChecks)次/\(Int(dialogTime * 1000))ms"
+    }
+}
+
 public final class QuitExecutor {
     public let backend: WindowBackend
-    /// 最多等多久（秒）。有些应用退出前要保存状态，会慢一些
+    /// 这是观察上限，不是固定等待时间；一旦发现进程结束就立即返回。
     public var timeout: Double = 6.0
-    public var pollInterval: Double = 0.1
-    /// 新窗口连续出现这么多次检查才算确认框（避开应用退出时一闪而过的窗口）
-    public var dialogConfirmTicks = 3
+    public var pollInterval: Double = 0.02
+    public var dialogInterval: Double = 0.15
+    public var axInterval: Double = 0.5
+    /// 整次辅助功能检查共用预算，不会按窗口数、属性数累加超时。
+    public var axBudget: Float = 0.12
+    public var dialogSettle: Double = 0.15
     public var allowedPIDs: Set<pid_t>?
+    public private(set) var lastTiming = QuitTiming()
 
     public init(backend: WindowBackend) {
         self.backend = backend
     }
 
     public func attempt(_ t: QuitTarget) -> QuitOutcome {
+        lastTiming = QuitTiming()
+        let start = backend.now()
         if let allowed = allowedPIDs, !allowed.contains(t.pid) { return .skipped(SkipReason.notAllowed.text) }
         guard backend.isAppRunning(t.pid) else { return .skipped("应用已经不在运行") }
         let baseline = Set(backend.onScreenWindows().filter { $0.pid == t.pid }.map(\.windowID))
-        guard backend.terminateApp(t.pid) else { return .failed("系统没有接受退出请求") }
+        let requestStart = backend.now()
+        lastTiming.prepare = requestStart - start
+        let accepted = backend.terminateApp(t.pid)
+        let observeStart = backend.now()
+        lastTiming.request = observeStart - requestStart
+        if !accepted {
+            return backend.isAppRunning(t.pid) ? .failed("系统没有接受退出请求") : .quit
+        }
 
         let ctx = QuitPendingContext(target: t, baseline: baseline)
-        let deadline = backend.now() + timeout
-        var dialogTicks = 0
-        var tick = 0
+        let deadline = observeStart + timeout
+        var nextDialogCheck = observeStart
+        var nextAXCheck = observeStart + axInterval
+        var dialogSince: Double?
+        var axDialog = false
+
+        func finish(_ result: QuitOutcome) -> QuitOutcome {
+            lastTiming.observe = backend.now() - observeStart
+            return result
+        }
+
         while true {
-            if !backend.isAppRunning(t.pid) { return .quit }
-            if hasDialog(ctx, checkAX: tick % 5 == 4) {
-                dialogTicks += 1
-                if dialogTicks >= dialogConfirmTicks { return .needsUser(ctx) }
-            } else {
-                dialogTicks = 0
+            // 快路径只看进程是否结束；不再每轮读取完整的辅助功能窗口信息。
+            if !backend.isAppRunning(t.pid) { return finish(.quit) }
+            let now = backend.now()
+            if now >= deadline {
+                return finish(.failed("应用没有在 \(Int(timeout)) 秒内退出（可能正忙或没有响应）；扫把不会强制退出它"))
             }
-            if backend.now() >= deadline {
-                return .failed("应用没有在 \(Int(timeout)) 秒内退出（可能正忙或没有响应）；窗口清理不会强制退出它")
+            if now >= nextDialogCheck {
+                let checkStart = backend.now()
+                var dialog = hasNewDialog(ctx)
+                if !dialog && backend.now() >= nextAXCheck {
+                    let remaining = deadline - backend.now()
+                    if remaining > 0, case .success(let found) = backend.appHasDialog(pid: t.pid, timeout: min(axBudget, Float(remaining))) {
+                        axDialog = found
+                    }
+                    nextAXCheck = backend.now() + axInterval
+                }
+                dialog = dialog || axDialog
+                lastTiming.dialogChecks += 1
+                lastTiming.dialogTime += backend.now() - checkStart
+                // 系统读取返回时应用可能已经退出，先复核，避免继续睡眠或误报确认框。
+                if !backend.isAppRunning(t.pid) { return finish(.quit) }
+                if dialog {
+                    if let since = dialogSince {
+                        if backend.now() - since >= dialogSettle { return finish(.needsUser(ctx)) }
+                    } else {
+                        dialogSince = backend.now()
+                    }
+                } else {
+                    dialogSince = nil
+                }
+                nextDialogCheck = backend.now() + dialogInterval
             }
-            backend.sleep(pollInterval)
-            tick += 1
+            let remaining = deadline - backend.now()
+            if remaining > 0 { backend.sleep(min(pollInterval, remaining)) }
         }
     }
 
-    /// 暂停等待用户处理期间反复调用
     public func checkPending(_ ctx: QuitPendingContext) -> PendingState {
         guard backend.isAppRunning(ctx.target.pid) else { return .closed }
-        if hasDialog(ctx, checkAX: false) { return .stillWaiting }
-        switch backend.axWindows(pid: ctx.target.pid, timeout: 0.5, includeSheetCheck: true) {
-        case .success(let list): return list.contains { $0.info.hasSheet } ? .stillWaiting : .keptOpen
-        case .failure: return .stillWaiting // 应用正忙时不下结论
+        if hasNewDialog(ctx) { return .stillWaiting }
+        let result = backend.appHasDialog(pid: ctx.target.pid, timeout: axBudget)
+        guard backend.isAppRunning(ctx.target.pid) else { return .closed }
+        switch result {
+        case .success(let found): return found ? .stillWaiting : .keptOpen
+        case .failure: return .stillWaiting // 应用正忙或权限不足，不假报用户已取消。
         }
     }
 
-    private func hasDialog(_ ctx: QuitPendingContext, checkAX: Bool) -> Bool {
-        let newDialogs = backend.onScreenWindows().filter {
+    private func hasNewDialog(_ ctx: QuitPendingContext) -> Bool {
+        backend.onScreenWindows().contains {
             $0.pid == ctx.target.pid && !ctx.baseline.contains($0.windowID) && WindowMatcher.isDialogCandidate($0)
         }
-        if !newDialogs.isEmpty { return true }
-        guard checkAX, case .success(let list) = backend.axWindows(pid: ctx.target.pid, timeout: 0.3, includeSheetCheck: true) else {
-            return false
-        }
-        return list.contains { $0.info.hasSheet }
     }
 }

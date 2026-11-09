@@ -27,6 +27,7 @@ struct HostConfigFile: Codable {
     var windows: [HostWindowSpec]
     var quitAfterLastWindow: Bool?
     var lifetimeSeconds: Double?
+    var quitDelay: Double?
 }
 
 struct HostWindowState: Codable {
@@ -62,6 +63,7 @@ final class TestHost {
     let configPath: URL
     var specs: [HostWindowSpec]
     let quitAfterLast: Bool
+    var quitDelay: Double?
     var process: Process?
 
     init(instance: String, appURL: URL, workDir: URL, specs: [HostWindowSpec], quitAfterLast: Bool = false) {
@@ -75,7 +77,7 @@ final class TestHost {
 
     func launch() throws {
         let cfg = HostConfigFile(instance: instance, statePath: statePath.path, windows: specs,
-                                 quitAfterLastWindow: quitAfterLast, lifetimeSeconds: 600)
+                                 quitAfterLastWindow: quitAfterLast, lifetimeSeconds: 600, quitDelay: quitDelay)
         try JSONEncoder().encode(cfg).write(to: configPath)
         let p = Process()
         p.executableURL = appURL.appendingPathComponent("Contents/MacOS/WCTestHost")
@@ -93,9 +95,15 @@ final class TestHost {
 
     func window(_ label: String) -> HostWindowState? { state()?.windows.first { $0.label == label } }
 
+    /// 测试窗口的编号一经出现就记住：新版系统在窗口关闭后，测试宿主报告的编号变为 -1
+    private var knownNumbers: [String: CGWindowID] = [:]
+
     func number(_ label: String) -> CGWindowID? {
-        guard let n = window(label)?.number, n > 0 else { return nil }
-        return CGWindowID(n)
+        if let n = window(label)?.number, n > 0 {
+            knownNumbers[label] = CGWindowID(n)
+            return CGWindowID(n)
+        }
+        return knownNumbers[label]
     }
 
     func isOpen(_ label: String) -> Bool { window(label)?.open ?? false }
@@ -144,6 +152,9 @@ final class SelfTestRunner {
     let controller: OverviewController
     let vm = SelfTestViewModel()
     let noAnimation: Bool
+    let tabsOnly: Bool
+    let closeFeedbackOnly: Bool
+    let closeTimingOnly: Bool
     let hostsDir: URL
     let reportDir: URL
     let workDir: URL
@@ -158,6 +169,9 @@ final class SelfTestRunner {
     init(controller: OverviewController, arguments: [String]) {
         self.controller = controller
         noAnimation = arguments.contains("--no-window-animation")
+        tabsOnly = arguments.contains("--selftest-tabs-only")
+        closeFeedbackOnly = arguments.contains("--selftest-close-feedback-only")
+        closeTimingOnly = arguments.contains("--selftest-close-timing")
         let fm = FileManager.default
         let appDir = Bundle.main.bundleURL.deletingLastPathComponent()
         // 构建时写入的项目位置：应用装在“应用程序”里时，靠它找到测试工具和报告文件夹
@@ -290,6 +304,28 @@ final class SelfTestRunner {
         let sr = Permissions.screenRecording
         note("开始自检。辅助功能：\(ax ? "已授权" : "未授权")；屏幕录制：\(sr ? "已授权" : "未授权")")
         try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        if closeTimingOnly {
+            await scenarioCloseTiming()
+            await cleanup()
+            finish()
+            if CommandLine.arguments.contains("--selftest-exit") { NSApp.terminate(nil) }
+            return
+        }
+        if closeFeedbackOnly {
+            await scenarioCloseFeedback()
+            await cleanup()
+            finish()
+            if CommandLine.arguments.contains("--selftest-exit") { NSApp.terminate(nil) }
+            return
+        }
+        if tabsOnly {
+            previousCloseOnClick = model.closeOnClick
+            controller.allowedPIDs = []
+            await scenarioBrowserTabs()
+            await cleanup()
+            finish()
+            return
+        }
 
         guard FileManager.default.fileExists(atPath: hostsDir.appendingPathComponent("WC测试应用A.app").path) else {
             add("E0", "测试工具", expected: "找到 WC测试应用A/B", actual: "在 \(hostsDir.path) 找不到测试工具", .fail)
@@ -377,7 +413,7 @@ final class SelfTestRunner {
                                  ("S19", "点应用图标退出应用"), ("S20", "退出前有未保存文档：保留原生提示"),
                                  ("S21", "没有窗口的后台应用也能退出"), ("S22", "应用栏圈选退出多个应用"),
                                  ("S23", "浏览器标签页：点击关闭、圈选关闭")] {
-                add(code, name, expected: "—", actual: "需要先在系统设置中给“窗口清理”授权辅助功能", .notRun)
+                add(code, name, expected: "—", actual: "需要先在系统设置中给“扫把”授权辅助功能", .notRun)
             }
             await scenarioPermissionMissing()
         }
@@ -603,8 +639,8 @@ final class SelfTestRunner {
         let ev = host("A").events("A6")
         let pass = ev.contains("sheetShown") && ev.contains("autoResponse:dontsave") && !host("A").isOpen("A6") && isClosed(status("A6"))
         add("S5", "未保存文档：由用户选择“不保存”",
-            expected: "窗口清理只按关闭按钮，不替用户选择；用户选“不保存”后才关闭，并标为已关闭",
-            actual: "“不保存”由测试应用模拟的用户点击（窗口清理未点击任何对话框按钮）；\(describe("A6"))", pass ? .pass : .fail)
+            expected: "扫把只按关闭按钮，不替用户选择；用户选“不保存”后才关闭，并标为已关闭",
+            actual: "“不保存”由测试应用模拟的用户点击（扫把未点击任何对话框按钮）；\(describe("A6"))", pass ? .pass : .fail)
         closeOverview()
     }
 
@@ -737,6 +773,8 @@ final class SelfTestRunner {
     func scenarioLastWindowQuits() async {
         guard await runSelection(["C1"]) else { add("S14", "最后一个窗口", expected: "", actual: "无法选中", .fail); return }
         let exited = await waitUntil(3) { !self.host("C").isRunning }
+        // “随后自行退出”由关闭后的复查补充（约 0.8 秒后），等它出现
+        _ = await waitUntil(3) { self.status("C1")?.detail.contains("自行退出") == true }
         let st = status("C1")
         add("S14", "关闭最后一个窗口后应用自行退出（兼容性边界）",
             expected: "如实标注“应用随后自行退出”；不重新启动应用来伪装",
@@ -1032,7 +1070,7 @@ final class SelfTestRunner {
         controller.switchPage(.browserTabs)
         _ = await waitUntil(10) { self.model.tabsPhase != .loading && self.model.tabsPhase != .idle }
         if case .needsPermission = model.tabsPhase {
-            note("请在系统弹出的询问中点“好”，允许“窗口清理”控制 Google Chrome（最多等 60 秒）")
+            note("请在系统弹出的询问中点“好”，允许“扫把”控制 Google Chrome（最多等 60 秒）")
             controller.requestTabsPermission()
             _ = await waitUntil(60) { self.model.tabsPhase == .ready && self.model.browserGroups.contains { $0.pid == pid } }
         }
@@ -1044,6 +1082,15 @@ final class SelfTestRunner {
             closeOverview(); return
         }
         let listed = g.tabs.map(\.title)
+        if let active = g.tabs.first(where: \.isActive) {
+            let previewKey = g.key(active)
+            let gotPreview = await waitUntil(8) { self.model.tabPreviews[previewKey]?.url == active.url }
+            let otherTabsHaveFakePreview = g.tabs.filter { !$0.isActive }.contains { self.model.tabPreviews[g.key($0)] != nil }
+            add("S24", "当前标签页小预览；后台标签不冒用当前画面",
+                expected: "测试 Chrome 当前标签有真实静态预览，其他新建后台标签没有伪造的预览；缓存不超过 3 MB",
+                actual: "当前标签\(gotPreview ? "已捕获预览" : "没有捕获预览")；后台标签\(otherTabsHaveFakePreview ? "错误出现了预览" : "没有冒用画面")；缓存 \(controller.tabPreviewCache.byteCount) 字节",
+                gotPreview && !otherTabsHaveFakePreview && controller.tabPreviewCache.byteCount <= 3 * 1024 * 1024 ? .pass : .fail)
+        }
         func key(_ n: Int) -> TabKey? { g.tabs.first { $0.title == "WC标签测试\(n)" }.map { g.key($0) } }
         let userTabsBefore = model.browserGroups.filter { $0.pid != pid }.reduce(0) { $0 + $1.tabs.count }
         var notes = ["列出 \(listed.count) 个标签页"]
@@ -1135,7 +1182,7 @@ final class SelfTestRunner {
         let f2 = DateFormatter()
         f2.locale = Locale(identifier: "en_US_POSIX")
         f2.dateFormat = "yyyyMMdd-HHmmss"
-        var md = "# 窗口清理 自检报告\n\n"
+        var md = "# 扫把 自检报告\n\n"
         md += "- 时间：\(f.string(from: Date()))\n"
         md += "- 系统：macOS \(ProcessInfo.processInfo.operatingSystemVersionString)\n"
         md += "- 应用：\(Bundle.main.bundlePath)\n"
@@ -1165,7 +1212,7 @@ final class SelfTestRunner {
     func showWindow() {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 600),
                          styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
-        w.title = "窗口清理 · 自检"
+        w.title = "扫把 · 自检"
         w.isReleasedWhenClosed = false
         w.contentView = NSHostingView(rootView: SelfTestView(vm: vm))
         w.center()
@@ -1181,7 +1228,7 @@ struct SelfTestView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("窗口清理 · 自检").font(.title2.bold())
+                Text("扫把 · 自检").font(.title2.bold())
                 if vm.running { ProgressView().controlSize(.small); Text("进行中，请不要操作鼠标键盘…").foregroundStyle(.secondary) }
                 Spacer()
             }

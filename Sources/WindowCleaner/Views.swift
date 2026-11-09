@@ -13,6 +13,7 @@ struct OverviewActions {
     var requestTabsPermission: () -> Void = {}
     var openAutomationSettings: () -> Void = {}
     var reloadTabs: () -> Void = {}
+    var chooseFaviconFolder: (String) -> Void = { _ in }
     /// 点了空白处（不在任何卡片上）：和按 Esc 一样退出总览
     var backgroundClicked: () -> Void = {}
     var marqueeFinished: ([WindowEntry]) -> Void = { _ in }
@@ -20,6 +21,7 @@ struct OverviewActions {
     var closeSelected: () -> Void = {}
     var stop: () -> Void = {}
     var refresh: () -> Void = {}
+    var setWindowScope: (WindowScope) -> Void = { _ in }
     var finish: () -> Void = {}
     var openAccessibility: () -> Void = {}
     var openScreenRecording: () -> Void = {}
@@ -89,23 +91,28 @@ struct OverviewRoot: View {
                 .onTapGesture { actions.backgroundClicked() }
             VStack(spacing: 14) {
                 HeaderBar(model: model, actions: actions)
-                if unifiedSelection {
-                    // 窗口区和应用栏共用一次框选：一个框可以同时选中窗口和应用
-                    VStack(spacing: 14) {
-                        content
+                Group {
+                    if unifiedSelection {
+                        // 窗口区和应用栏共用一次框选：一个框可以同时选中窗口和应用
+                        workspace
+                            .contentShape(Rectangle())
+                            .gesture(windowsPageGesture)
+                    } else {
+                        workspace
+                    }
+                }
+                .coordinateSpace(name: CloseFeedbackCoordinator.space)
+                .overlay {
+                    if model.page == .windows {
+                        CloseFeedbackOverlay(feedback: model.closeFeedback)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        if showsAppBar {
-                            AppBar(model: model, actions: actions)
-                        }
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                            .clipped()
                     }
-                    .contentShape(Rectangle())
-                    .gesture(windowsPageGesture)
-                } else {
-                    content
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if showsAppBar {
-                        AppBar(model: model, actions: actions)
-                    }
+                }
+                .onPreferenceChange(CloseFeedbackFramesKey.self) { frames in
+                    MainActor.assumeIsolated { model.closeFeedback.frames = frames }
                 }
                 BottomBar(model: model, actions: actions)
             }
@@ -118,6 +125,13 @@ struct OverviewRoot: View {
         .overlay(MarqueeOverlay(marquee: model.marquee, closeMode: model.closeOnClick, count: 0, text: marqueeText))
         .environment(\.colorScheme, .dark)
         .ignoresSafeArea()
+    }
+
+    private var workspace: some View {
+        VStack(spacing: 14) {
+            content.frame(maxWidth: .infinity, maxHeight: .infinity)
+            if showsAppBar { AppBar(model: model, actions: actions) }
+        }
     }
 
     /// “窗口与应用”页显示卡片时，使用统一框选
@@ -216,11 +230,11 @@ struct OverviewRoot: View {
                     Image(systemName: "macwindow.on.rectangle")
                         .font(.system(size: 44, weight: .light))
                         .foregroundStyle(.secondary)
-                    Text("当前桌面没有可显示的窗口")
+                    Text(model.windowScope == .allDesktops ? "没有可显示的应用窗口" : "当前桌面没有可显示的窗口")
                         .font(.title3)
-                    Text(model.apps.isEmpty
-                         ? "最小化、隐藏、全屏或在其他桌面空间里的窗口暂不显示。"
-                         : "可以在下方退出正在运行的应用。最小化、隐藏、全屏或在其他桌面空间里的窗口暂不显示。")
+                    Text(model.windowScope == .currentDesktop
+                         ? "切换到“全部桌面”可查看其他桌面和全屏窗口。"
+                         : "可以在下方退出正在运行的应用。系统不提供预览的窗口可能无法显示。")
                         .foregroundStyle(.secondary)
                 }
             } else {
@@ -243,7 +257,7 @@ struct HeaderBar: View {
                     .resizable()
                     .frame(width: 34, height: 34)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("窗口清理")
+                    Text("扫把")
                         .font(.system(size: 20, weight: .semibold))
                     Text(hint)
                         .font(.system(size: 12))
@@ -312,6 +326,17 @@ struct PageTabs: View {
             .padding(3)
             .glassCapsule()
             Spacer()
+            if model.page == .windows {
+                Picker("窗口范围", selection: Binding(get: { model.windowScope }, set: actions.setWindowScope)) {
+                    Text("全部桌面").tag(WindowScope.allDesktops)
+                    Text("当前桌面").tag(WindowScope.currentDesktop)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 180)
+                .disabled(model.activeCount > 0 || model.phase == .running || model.phase == .paused)
+                .help("查看全部桌面上能确认的正常窗口（包括全屏）；隐藏、最小化和后台保留窗口不展示。")
+            }
         }
     }
 
@@ -393,7 +418,7 @@ struct CardGrid: View {
     var body: some View {
         GeometryReader { geo in
             let (cols, w) = Self.layout(count: model.entries.count, in: geo.size,
-                                        extraLabel: model.entries.contains { !$0.isClosable } ? 30 : 0)
+                                        extraLabel: model.entries.contains { !$0.isClosable || $0.locationLabel != nil } ? 30 : 0)
             LazyVGrid(columns: Array(repeating: GridItem(.fixed(w), spacing: Self.spacing, alignment: .top), count: cols),
                       spacing: Self.spacing) {
                     ForEach(Array(model.entries.enumerated()), id: \.element.id) { index, e in
@@ -422,7 +447,7 @@ struct CardGrid: View {
                             .scaleEffect(model.cardsRevealed || model.reduceMotion ? 1 : 0.9)
                             .offset(y: model.cardsRevealed || model.reduceMotion ? 0 : 14)
                             .animation(model.reduceMotion ? .easeOut(duration: 0.15)
-                                       : .spring(response: 0.4, dampingFraction: 0.82).delay(min(Double(index) * 0.025, 0.3)),
+                                       : .spring(response: 0.32, dampingFraction: 0.86).delay(min(Double(index) * 0.018, 0.18)),
                                        value: model.cardsRevealed)
                     }
             }
@@ -547,9 +572,9 @@ struct CardView: View {
         .frame(minHeight: boxHeight + 48, alignment: .bottom)
         // 关闭成功：淡出并缩小
         .opacity(vanishing ? 0 : 1)
-        .scaleEffect(vanishing ? 0.82 : 1)
-        .blur(radius: vanishing ? 6 : 0)
-        .animation(.easeOut(duration: 0.3), value: vanishing)
+        .scaleEffect(vanishing && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.82 : 1)
+        .blur(radius: vanishing && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 4 : 0)
+        .animation(.easeOut(duration: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.15 : 0.2), value: vanishing)
         .help(tooltip)
     }
 
@@ -575,6 +600,13 @@ struct CardView: View {
                     }
                 }
                 .shadow(color: .black.opacity(0.55), radius: 3, y: 1)
+                if let location = entry.locationLabel {
+                    Text(location)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.black.opacity(0.22), in: Capsule())
+                }
                 if let status, !status.detail.isEmpty {
                     Text(status.detail)
                         .font(.system(size: 11, weight: .medium))
@@ -637,6 +669,12 @@ struct CardView: View {
             }
         }
         .frame(width: fitted.width, height: fitted.height)
+        .background(GeometryReader { geometry in
+            Color.clear.preference(key: CloseFeedbackFramesKey.self, value: [
+                .window(entry.id): CloseFeedbackGeometry(
+                    rect: geometry.frame(in: .named(CloseFeedbackCoordinator.space)), cornerRadius: 9)
+            ])
+        })
         .clipShape(shape)
         // 窗口自身的细边（像真实窗口），以及悬停/选中/圈选时的高亮边
         .overlay(shape.strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5))
@@ -888,14 +926,14 @@ struct BrowserTabsPage: View {
         return VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
                 Image(systemName: "lock.shield").font(.system(size: 30)).foregroundStyle(Color.accentColor)
-                Text(denied ? "你没有允许“窗口清理”控制 \(list)" : "需要你允许“窗口清理”控制 \(list)")
+                Text(denied ? "你没有允许“扫把”控制 \(list)" : "需要你允许“扫把”控制 \(list)")
                     .font(.system(size: 18, weight: .semibold))
             }
             Text("只用来读取每个窗口里的标签页标题和网址，并在你点击时关闭对应的标签页。不读取网页内容，不上传、不保存。标签页按浏览器内部的唯一编号关闭，不会因为同名而关错。")
                 .font(.system(size: 12)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if denied {
-                Text("请到 系统设置 › 隐私与安全性 › 自动化，在“窗口清理”下面打开 \(list) 的开关，然后回到这里点“重试”。")
+                Text("请到 系统设置 › 隐私与安全性 › 自动化，在“扫把”下面打开 \(list) 的开关，然后回到这里点“重试”。")
                     .font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
                 HStack {
                     Button("打开系统设置", action: actions.openAutomationSettings)
@@ -937,9 +975,21 @@ struct BrowserTabsPage: View {
                 .labelsHidden()
                 .frame(width: 150)
                 .help("标签页的分组方式")
+                Button {
+                    let bundle = model.faviconAccessBundleID ?? model.browserGroups.compactMap { NSRunningApplication(processIdentifier: $0.pid)?.bundleIdentifier }.first ?? "com.google.Chrome"
+                    actions.chooseFaviconFolder(bundle)
+                } label: {
+                    Label(model.faviconAccessBundleID == nil ? "图标资料夹" : "授权网站图标", systemImage: "folder.badge.gearshape")
+                }
+                .controlSize(.small)
+                .disabled(model.activeCount > 0)
+                .help("使用系统文件夹选择器授权本机图标目录，不联网下载图标。")
                 Text("\(model.browserGroups.count) 个窗口 · \(model.tabCount) 个标签页" + (model.tabFilter.isEmpty ? "" : " · 匹配 \(groups.reduce(0) { $0 + $1.items.count }) 个"))
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                 Spacer()
+            }
+            if !model.faviconFolderMessage.isEmpty {
+                Text(model.faviconFolderMessage).font(.system(size: 11)).foregroundStyle(.orange)
             }
             if groups.isEmpty {
                 message(icon: model.tabFilter.isEmpty ? "checkmark.circle" : "magnifyingglass",
@@ -977,13 +1027,8 @@ struct BrowserTabsPage: View {
         HStack(spacing: 10) {
             switch g.kind {
             case .window(let cardID, let appName, let pid):
-                if let card = cardID, let thumb = model.thumbnails[card] {
-                    Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fit)
-                        .frame(width: 72, height: 46)
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                } else {
-                    Image(nsImage: model.icon(for: pid)).resizable().frame(width: 28, height: 28)
-                }
+                // 组头只放浏览器图标；画面预览统一放在各标签页上，避免同一画面出现两次
+                Image(nsImage: model.icon(for: pid)).resizable().frame(width: 28, height: 28)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(g.title.isEmpty ? "（无标题窗口）" : g.title)
                         .font(.system(size: 13, weight: .semibold)).lineLimit(1).truncationMode(.middle)
@@ -1025,7 +1070,8 @@ struct BrowserTabsPage: View {
 
     /// 标签页图标：网站图标 → 浏览器自己的页面用浏览器图标 → 本地文件用文档图标 → 地球
     func tileIcon(_ t: BrowserTab, pid: pid_t) -> NSImage? {
-        if let f = model.favicon(for: t.url) { return f }
+        if let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier,
+           let f = model.favicon(for: t.url, bundleID: bundleID) { return f }
         switch BrowserTabSupport.siteName(for: t.url) {
         case BrowserTabSupport.internalPagesName: return model.icon(for: pid)
         default: return nil
@@ -1051,6 +1097,7 @@ struct BrowserTabsPage: View {
                     let t = item.tab
                     TabTile(tab: t,
                             icon: tileIcon(t, pid: k.pid),
+                            preview: model.tabPreviews[k],
                             status: model.tabStatuses[k],
                             selectionIndex: model.tabSelectionIndex(k),
                             closeOnClick: model.closeOnClick,
@@ -1115,6 +1162,7 @@ struct BrowserTabsPage: View {
 struct TabTile: View {
     let tab: BrowserTab
     var icon: NSImage?
+    var preview: TabPreview?
     let status: ItemStatus?
     let selectionIndex: Int?
     let closeOnClick: Bool
@@ -1125,27 +1173,14 @@ struct TabTile: View {
 
     var body: some View {
         HStack(spacing: 9) {
-            ZStack {
-                switch status {
-                case .working?: ProgressView().controlSize(.small)
-                case .queued?: Image(systemName: "clock.fill").foregroundStyle(.secondary)
-                case .waitingUser?: Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
-                case .skipped?, .failed?: Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red)
-                case .closed?: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                case nil:
-                    if let icon {
-                        Image(nsImage: icon).resizable().interpolation(.high).frame(width: 16, height: 16)
-                    } else {
-                        Image(systemName: tab.url.hasPrefix("file:") ? "doc" : "globe").foregroundStyle(.secondary)
-                    }
+            previewArea
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 5) {
+                    statusIcon
+                    Text(tab.title.isEmpty ? "（无标题）" : tab.title)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .lineLimit(2).truncationMode(.middle)
                 }
-            }
-            .font(.system(size: 15))
-            .frame(width: 20)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(tab.title.isEmpty ? "（无标题）" : tab.title)
-                    .font(.system(size: 12.5, weight: .medium))
-                    .lineLimit(1).truncationMode(.middle)
                 HStack(spacing: 6) {
                     Text(tab.host).font(.system(size: 10.5)).foregroundStyle(.secondary).lineLimit(1)
                     if tab.isActive {
@@ -1170,14 +1205,58 @@ struct TabTile: View {
             }
         }
         .padding(.horizontal, 10).padding(.vertical, 8)
-        .frame(minHeight: 50)
+        .frame(minHeight: 82)
         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(fill))
         .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(borderStyle, lineWidth: inMarquee || selectionIndex != nil ? 2 : 1))
         .contentShape(RoundedRectangle(cornerRadius: 10))
         .opacity(vanishing ? 0 : 1)
         .scaleEffect(vanishing ? 0.9 : 1)
-        .animation(.easeOut(duration: 0.25), value: vanishing)
+        .animation(.easeOut(duration: 0.18), value: vanishing)
         .help(tab.title + "\n" + tab.url)
+    }
+
+    var previewArea: some View {
+        ZStack(alignment: .bottomTrailing) {
+            RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.05))
+            if let preview, preview.url == tab.url {
+                Image(nsImage: preview.image).resizable().interpolation(.high).aspectRatio(contentMode: .fit)
+                Text(tab.isActive ? "静态预览" : "上次预览")
+                    .font(.system(size: 8, weight: .medium))
+                    .padding(.horizontal, 4).padding(.vertical, 2)
+                    .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 3))
+                    .foregroundStyle(.white)
+            } else {
+                VStack(spacing: 3) {
+                    Image(systemName: "macwindow").font(.system(size: 17, weight: .light))
+                    Text("暂无预览").font(.system(size: 9))
+                }
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(width: 92, height: 60)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .help(preview == nil ? "后台标签页不能直接截图；不会自动切换标签或重新访问网页。" : "只在内存中的静态画面，不是实时视频。")
+    }
+
+    var statusIcon: some View {
+            ZStack {
+                switch status {
+                case .working?: ProgressView().controlSize(.small)
+                case .queued?: Image(systemName: "clock.fill").foregroundStyle(.secondary)
+                case .waitingUser?: Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
+                case .skipped?, .failed?: Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red)
+                case .closed?: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                case nil:
+                    if let icon {
+                        Image(nsImage: icon).resizable().interpolation(.high).frame(width: 16, height: 16)
+                    } else {
+                        Image(systemName: tab.url.hasPrefix("file:") ? "doc" : "globe").foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .font(.system(size: 15))
+            .frame(width: 20)
     }
 
     func detail(_ s: ItemStatus) -> some View {
@@ -1247,7 +1326,7 @@ struct AppBar: View {
                         .opacity(model.cardsRevealed ? 1 : 0)
                         .offset(y: model.cardsRevealed || model.reduceMotion ? 0 : 10)
                         .animation(model.reduceMotion ? .easeOut(duration: 0.15)
-                                   : .spring(response: 0.4, dampingFraction: 0.85).delay(0.08 + min(Double(index) * 0.02, 0.25)),
+                                   : .spring(response: 0.32, dampingFraction: 0.88).delay(0.05 + min(Double(index) * 0.012, 0.15)),
                                    value: model.cardsRevealed)
                 }
             }
@@ -1300,6 +1379,12 @@ struct AppIconView: View {
                         .resizable()
                         .interpolation(.high)
                         .frame(width: iconSize, height: iconSize)
+                        .background(GeometryReader { geometry in
+                            Color.clear.preference(key: CloseFeedbackFramesKey.self, value: [
+                                .app(app.id): CloseFeedbackGeometry(
+                                    rect: geometry.frame(in: .named(CloseFeedbackCoordinator.space)), cornerRadius: iconSize * 0.23)
+                            ])
+                        })
                         .opacity(status == nil || status == .queued ? 1 : 0.55)
                     if let status {
                         switch status {
@@ -1340,8 +1425,8 @@ struct AppIconView: View {
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
             .strokeBorder(borderColor, lineWidth: borderColor == .clear ? 0 : 2))
         .opacity(vanishing ? 0 : 1)
-        .scaleEffect(vanishing ? 0.7 : 1)
-        .animation(.easeOut(duration: 0.3), value: vanishing)
+        .scaleEffect(vanishing && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.7 : 1)
+        .animation(.easeOut(duration: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.15 : 0.2), value: vanishing)
         .help(helpText)
     }
 
@@ -1441,7 +1526,7 @@ struct PermissionView: View {
                     .foregroundStyle(Color.accentColor)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("需要你授权后才能使用").font(.system(size: 22, weight: .semibold))
-                    Text("窗口清理只在本机运行，不联网；截图只用于显示缩略图，不上传、不保存。")
+                    Text("扫把只在本机运行，不联网；截图只用于显示缩略图，不上传、不保存。")
                         .font(.system(size: 12)).foregroundStyle(.secondary)
                 }
             }
@@ -1454,14 +1539,14 @@ struct PermissionView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("操作步骤").font(.system(size: 13, weight: .semibold))
                 Text("1. 点“打开设置”，系统设置会打开“隐私与安全性 › 辅助功能”。")
-                Text("2. 在列表里找到“窗口清理”，打开右侧开关（可能需要输入开机密码）。")
-                Text("3. 回到这里点“重新检测”。屏幕录制同理；授权后系统可能要求重新打开本应用，点“重新打开窗口清理”即可。")
+                Text("2. 在列表里找到“扫把”，打开右侧开关（可能需要输入开机密码）。")
+                Text("3. 回到这里点“重新检测”。屏幕录制同理；授权后系统可能要求重新打开本应用，点“重新打开扫把”即可。")
             }
             .font(.system(size: 12))
             .foregroundStyle(.secondary)
             HStack {
                 Button("重新检测", action: actions.recheckPermissions)
-                Button("重新打开窗口清理", action: actions.relaunch)
+                Button("重新打开扫把", action: actions.relaunch)
                 Spacer()
             }
         }
@@ -1520,7 +1605,7 @@ struct PausePanelView: View {
                     .font(.system(size: 12))
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Text("请直接在那个对话框里做选择。窗口清理不会替你点任何按钮。")
+            Text("请直接在那个对话框里做选择。扫把不会替你点任何按钮。")
                 .font(.system(size: 12)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 6) {
@@ -1561,7 +1646,7 @@ struct PermissionWaitPanelView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("请在系统设置中为“窗口清理”授权").font(.system(size: 14, weight: .semibold))
+            Text("请在系统设置中为“扫把”授权").font(.system(size: 14, weight: .semibold))
             HStack {
                 Image(systemName: model.axTrusted ? "checkmark.circle.fill" : "circle.dashed")
                     .foregroundStyle(model.axTrusted ? .green : .secondary)
@@ -1576,7 +1661,7 @@ struct PermissionWaitPanelView: View {
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             HStack {
                 Spacer()
-                Button("返回窗口清理", action: onBack).buttonStyle(.borderedProminent)
+                Button("返回扫把", action: onBack).buttonStyle(.borderedProminent)
             }
         }
         .font(.system(size: 12))
